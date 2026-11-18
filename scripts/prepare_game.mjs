@@ -46,6 +46,11 @@ with zipfile.ZipFile(apk_path, "r") as z:
     count = 0
     for info in z.infolist():
         name = info.filename
+        if not (info.flag_bits & 0x800):
+            try:
+                name = name.encode("cp437").decode("utf-8")
+            except UnicodeDecodeError:
+                pass
         if name.startswith("assets/www/") and not name.endswith("/"):
             rel = name[len("assets/www/"):]
             dest = os.path.join(www_dir, rel)

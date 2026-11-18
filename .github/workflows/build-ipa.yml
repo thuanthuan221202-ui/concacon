@@ -1,6 +1,8 @@
 name: Build Z Legends 3 iOS (.ipa)
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       apk_url:
