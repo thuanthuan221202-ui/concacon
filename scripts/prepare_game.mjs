@@ -187,7 +187,7 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
         await execFileAsync('ffmpeg', [
           '-nostdin', '-y', '-loglevel', 'error',
           '-i', inPath,
-          '-vn', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+          '-vn', '-ac', '1', '-ar', '22050', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart',
           outPath,
         ]);
       } catch (err) {
@@ -296,11 +296,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
   }
 
   // 6. Cap DevicePixelRatio to 2.0 to prevent 3x Super Retina framebuffer VRAM explosion
-  if (!rt.includes('Math.min(2.0, (this.isRetina')) {
+  if (!rt.includes('Math.min(1.5, (this.isRetina')) {
     const beforeDpr = rt;
     rt = rt.replace(
       'this.devicePixelRatio = (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1);',
-      'this.devicePixelRatio = Math.min(2.0, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
+      'this.devicePixelRatio = Math.min(1.5, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
     );
     if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
   }
@@ -393,6 +393,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				}
 				function onUpload(source) {
 					if (!webGL_texture.c2deleted) {
+						if (selfGL.evictUnusedTextures) {
+							selfGL.evictUnusedTextures(false, webGL_texture);
+						}
 						selfGL.endBatch();
 						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
 						gl.pixelStorei(gl["UNPACK_PREMULTIPLY_ALPHA_WEBGL"], true);
@@ -415,8 +418,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						})
 						.then(function (blob) { return createImageBitmap(blob); })
 						.then(function (bitmap) {
-							onUpload(bitmap);
-							if (bitmap && bitmap.close) bitmap.close();
+							try {
+								onUpload(bitmap);
+							} finally {
+								if (bitmap && bitmap.close) bitmap.close();
+							}
 						})
 						.catch(function () {
 							fallbackImage();
@@ -461,7 +467,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			if (!tex.c2isLoaded && !tex.c2loading && tex.c2lazyLoadFunc)
 			{
 				tex.c2loading = true;
-				window["__c2EnqueueLazyTex"](tex.c2lazyLoadFunc, tex);
+				window["__c2EnqueueLazyTex"](tex.c2lazyLoadFunc, tex, true);
 			}
 		}`
     );
@@ -475,11 +481,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		this.gl.deleteTexture(tex);
 	};
 	var blankPixel1x1 = new Uint8Array([0, 0, 0, 0]);
-	GLWrap_.prototype.evictUnusedTextures = function (forceAll)
+	GLWrap_.prototype.evictUnusedTextures = function (forceAll, excludeTex)
 	{
 		var now = Date.now();
-		var VRAM_BUDGET = 80 * 1024 * 1024;
-		var UNUSED_THRESHOLD = 5000;
+		var VRAM_BUDGET = 48 * 1024 * 1024;
+		var UNUSED_THRESHOLD = 2500;
 		var totalVRAM = 0;
 		var loadedList = [];
 		var i, len, t;
@@ -502,8 +508,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			for (i = 0, len = loadedList.length; i < len; i++)
 			{
 				t = loadedList[i];
+				if (t === excludeTex)
+					continue;
 				var age = now - (t.c2lastUsedTime || 0);
-				if (!forceAll && age < UNUSED_THRESHOLD && totalVRAM <= 120 * 1024 * 1024)
+				if (!forceAll && age < UNUSED_THRESHOLD && totalVRAM <= 68 * 1024 * 1024)
 					continue;
 				gl.bindTexture(gl.TEXTURE_2D, t);
 				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, blankPixel1x1);
@@ -534,7 +542,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (this.glwrap && this.glwrap.evictUnusedTextures)
 		{
 			this.__vramCheckCounter = (this.__vramCheckCounter || 0) + 1;
-			if (this.__vramCheckCounter >= 180)
+			if (this.__vramCheckCounter >= 60)
 			{
 				this.__vramCheckCounter = 0;
 				this.glwrap.evictUnusedTextures(false);
@@ -577,7 +585,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (this.cur_animation && this.cur_animation.frames)
 		{
 			var _cfs = this.cur_animation.frames;
-			for (var _ci = 0, _clen = _cfs.length; _ci < _clen; _ci++)
+			for (var _ci = 0, _clen = Math.min(_cfs.length, 4); _ci < _clen; _ci++)
 			{
 				var _ctex = _cfs[_ci].webGL_texture;
 				if (_ctex && !_ctex.c2isLoaded && !_ctex.c2loading && _ctex.c2lazyLoadFunc)
@@ -597,7 +605,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
       `if (anim && anim.frames)
 		{
-			for (var _ai = 0, _alen = anim.frames.length; _ai < _alen; _ai++)
+			for (var _ai = 0, _alen = Math.min(anim.frames.length, 4); _ai < _alen; _ai++)
 			{
 				var _atex = anim.frames[_ai].webGL_texture;
 				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
@@ -630,7 +638,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (!inUse || forceAll) {
 					b.release();
 					audioBuffers.splice(ti, 1);
-					if (!forceAll && audioBuffers.length <= 15) break;
+					if (!forceAll && audioBuffers.length <= 6) break;
 				}
 			}
 		}
@@ -657,7 +665,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			if (playMusicAsSoundWorkaround && is_music)
 				this.releaseAllMusicBuffers();
-			if (!is_music && audioBuffers.length >= 20 && window.__c2TrimAudioBuffers)
+			if (!is_music && audioBuffers.length >= 10 && window.__c2TrimAudioBuffers)
 				window.__c2TrimAudioBuffers(false);
 			ret = new C2AudioBuffer(src_, is_music);
 			audioBuffers.push(ret);
@@ -729,23 +737,43 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     </style>
     <script>
     (function () {
-        // Throttled on-demand GPU texture loader queue (concurrency 2, createImageBitmap zero-RAM retention)
+        // Throttled on-demand GPU texture loader queue (concurrency 1, priority + dedup for iOS Jetsam stability)
         var texQueue = [];
         var activeTexLoads = 0;
-        var MAX_TEX_CONCURRENCY = 2;
+        var MAX_TEX_CONCURRENCY = 1;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
                 activeTexLoads++;
                 var job = texQueue.shift();
                 job(function () {
                     activeTexLoads--;
-                    setTimeout(pumpTexQueue, 4);
+                    setTimeout(pumpTexQueue, 2);
                 });
             }
         }
-        window.__c2EnqueueLazyTex = function (job, tex) {
+        window.__c2EnqueueLazyTex = function (job, tex, highPriority) {
+            for (var qi = 0; qi < texQueue.length; qi++) {
+                if (texQueue[qi] && texQueue[qi].tex === tex) {
+                    if (highPriority && qi > 0) {
+                        var existing = texQueue.splice(qi, 1)[0];
+                        texQueue.unshift(existing);
+                    }
+                    return;
+                }
+            }
             job.tex = tex;
-            texQueue.push(job);
+            if (highPriority) {
+                texQueue.unshift(job);
+            } else {
+                texQueue.push(job);
+            }
+            // Prevent unbounded preload backlog during heavy Z-move bursts
+            while (texQueue.length > 12) {
+                var dropped = texQueue.pop();
+                if (dropped && dropped.tex) {
+                    dropped.tex.c2loading = false;
+                }
+            }
             pumpTexQueue();
         };
         window.__c2ClearTexQueue = function () {
