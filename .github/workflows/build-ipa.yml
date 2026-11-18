@@ -1,0 +1,133 @@
+name: Build Z Legends 3 iOS (.ipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "(Tuy chon) Link tai truc tiep file APK (de trong neu da dinh kem APK trong Releases)"
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout ma nguon du an
+        uses: actions/checkout@v4
+
+      - name: Tim hoac tai file APK nguon
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APK_URL: ${{ inputs.apk_url }}
+        run: |
+          set -euo pipefail
+          if [ -f "ios/www/data.js" ]; then
+            echo "FOUND_MODE=www" >> "$GITHUB_ENV"
+            echo "Da co san thu muc ios/www trong repo."
+            exit 0
+          fi
+
+          REPO_APK=$(find . -maxdepth 2 -iname "*.apk" | head -n 1 || true)
+          if [ -n "$REPO_APK" ]; then
+            cp "$REPO_APK" input.apk
+            echo "FOUND_MODE=apk" >> "$GITHUB_ENV"
+            echo "Su dung file APK trong repo: $REPO_APK"
+            exit 0
+          fi
+
+          if [ -n "$APK_URL" ]; then
+            echo "Dang tai APK tu URL..."
+            curl -fL "$APK_URL" -o input.apk
+            echo "FOUND_MODE=apk" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          ASSET_ID=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[].assets[] | select(.name | ascii_downcase | endswith(".apk"))][0].id // empty')
+          if [ -n "$ASSET_ID" ]; then
+            echo "Dang tai file APK tu GitHub Releases (Asset ID: $ASSET_ID)..."
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" -H "Accept: application/octet-stream" > input.apk
+            ls -lh input.apk
+            echo "FOUND_MODE=apk" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          echo "::error::Chua tim thay file .apk! Hay vao muc Releases cua repo -> Tao Release moi -> Keo tha file APK game vao va nhan Publish release."
+          exit 1
+
+      - name: Kiem tra cong cu ffmpeg va xcodegen tren macOS
+        run: |
+          command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          ffmpeg -version | head -n 1
+          xcodegen --version
+
+      - name: Giai nen APK, sua runtime iOS va chuyen 3525 file am thanh sang .m4a
+        run: |
+          if [ "$FOUND_MODE" = "apk" ]; then
+            node scripts/prepare_game.mjs --apk input.apk --ios-dir ios
+            rm -f input.apk
+          else
+            node scripts/prepare_game.mjs --ios-dir ios
+          fi
+
+      - name: Bien dich ung dung iOS (ARM64) bang Xcode
+        run: |
+          cd ios
+          xcodegen generate
+          xcodebuild clean build \
+            -project ZLegends3.xcodeproj \
+            -scheme ZLegends3 \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Dong goi va ky Ad-hoc thanh file Z_Legends_3.ipa
+        run: |
+          APP_PATH="ios/build/Build/Products/Release-iphoneos/ZLegends3.app"
+          test -f "$APP_PATH/ZLegends3"
+          test -f "$APP_PATH/www/index.html"
+          test -f "$APP_PATH/www/data.js"
+
+          rm -rf dist
+          mkdir -p dist/Payload
+          cp -R "$APP_PATH" dist/Payload/ZLegends3.app
+          codesign --force --deep --sign - dist/Payload/ZLegends3.app
+
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent Payload Z_Legends_3.ipa
+          ls -lh Z_Legends_3.ipa
+
+      - name: Tai file Z_Legends_3.ipa len Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Z_Legends_3_iOS_IPA
+          path: dist/Z_Legends_3.ipa
+          if-no-files-found: error
+
+      - name: Dinh kem truc tiep Z_Legends_3.ipa vao Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.draft == false)][0].tag_name // empty')
+          if [ -n "$TAG" ]; then
+            echo "Dang dinh kem Z_Legends_3.ipa vao Release $TAG..."
+            gh release upload "$TAG" dist/Z_Legends_3.ipa --clobber || echo "Da luu file trong Artifacts"
+          else
+            echo "Tao Release moi v2.7.7-ios chua file Z_Legends_3.ipa..."
+            gh release create "v2.7.7-ios" dist/Z_Legends_3.ipa \
+              --title "Z Legends 3 v2.7.7 - Ban iOS (.ipa)" \
+              --notes "File **Z_Legends_3.ipa** da bien dich san cho iPhone va iPad (ho tro Sideloadly, AltStore, SideStore, TrollStore, ESign)." || echo "Da luu file trong Artifacts"
+          fi

@@ -1,0 +1,8 @@
+ios/www/
+ios/build/
+ios/ZLegends3.xcodeproj/
+ios/Assets.xcassets/
+dist/
+input.apk
+*.ipa
+.DS_Store
