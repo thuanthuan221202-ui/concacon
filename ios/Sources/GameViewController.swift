@@ -97,6 +97,12 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         )
     }
 
+    override func didReceiveMemoryWarning() {
+        super.didReceiveMemoryWarning()
+        NSLog("[ZLegends3] OS Memory Warning received! Purging game textures and audio...")
+        webView?.evaluateJavaScript("if (window.__c2PurgeMemory) window.__c2PurgeMemory();", completionHandler: nil)
+    }
+
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,

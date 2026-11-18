@@ -214,7 +214,7 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
 }
 
 export function patchConstruct2RuntimeAndHtml(wwwDir) {
-  console.log('[6/7] Patching Construct 2 runtime (iOS WebKit Jetsam RAM fix + on-demand GPU texture streaming)...');
+  console.log('[6/7] Patching Construct 2 runtime (iOS WebKit Jetsam RAM fix + VRAM LRU Eviction + on-demand GPU texture streaming)...');
   const rtPath = path.join(wwwDir, 'c2runtime.js');
   let rt = fs.readFileSync(rtPath, 'utf8');
 
@@ -295,7 +295,17 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
   }
 
-  // 6. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
+  // 6. Cap DevicePixelRatio to 2.0 to prevent 3x Super Retina framebuffer VRAM explosion
+  if (!rt.includes('Math.min(2.0, (this.isRetina')) {
+    const beforeDpr = rt;
+    rt = rt.replace(
+      'this.devicePixelRatio = (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1);',
+      'this.devicePixelRatio = Math.min(2.0, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
+    );
+    if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
+  }
+
+  // 7. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
   if (!rt.includes('c2lazyLoadFunc')) {
     const beforeGL = rt;
     rt = rt.replace(
@@ -352,11 +362,13 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			this.lastTexture0 = null;
 			webGL_texture.c2width = img.width;
 			webGL_texture.c2height = img.height;
+			webGL_texture.c2bytes = (img.width || 256) * (img.height || 256) * 4;
 			webGL_texture.c2refcount = 1;
 			webGL_texture.c2texkey = tex_key;
 			webGL_texture.c2deleted = false;
 			webGL_texture.c2isLoaded = false;
 			webGL_texture.c2loading = false;
+			webGL_texture.c2lastUsedTime = Date.now();
 			all_textures.push(webGL_texture);
 			textures_by_src[tex_key] = webGL_texture;
 
@@ -389,13 +401,14 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						selfGL.lastTexture0 = null;
 						webGL_texture.c2isLoaded = true;
 						webGL_texture.c2loading = false;
+						webGL_texture.c2lastUsedTime = Date.now();
 						var rtInst = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
 						if (rtInst) rtInst.redraw = true;
 					}
 					if (doneCb) doneCb();
 				}
 				if (typeof createImageBitmap === "function" && typeof fetch === "function") {
-					fetch(texSrc)
+					fetch(texSrc, { cache: "no-store" })
 						.then(function (res) {
 							if (!res.ok) throw new Error("Fetch failed: " + res.status);
 							return res.blob();
@@ -436,25 +449,110 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeGL) throw new Error('Failed to patch GLWrap loadTexture');
 
-    // 7. Load textures on demand when GLWrap_.setTexture is called
+    // 8. Load textures on demand when GLWrap_.setTexture is called + refresh lastUsedTime
     const beforeST = rt;
     rt = rt.replace(
       /GLWrap_\.prototype\.setTexture\s*=\s*function\s*\(tex\)\s*\{/,
       `GLWrap_.prototype.setTexture = function (tex)
 	{
-		if (tex && !tex.c2isLoaded && !tex.c2loading && tex.c2lazyLoadFunc)
+		if (tex)
 		{
-			tex.c2loading = true;
-			window["__c2EnqueueLazyTex"](tex.c2lazyLoadFunc);
+			tex.c2lastUsedTime = Date.now();
+			if (!tex.c2isLoaded && !tex.c2loading && tex.c2lazyLoadFunc)
+			{
+				tex.c2loading = true;
+				window["__c2EnqueueLazyTex"](tex.c2lazyLoadFunc, tex);
+			}
 		}`
     );
     if (rt === beforeST) throw new Error('Failed to patch setTexture');
 
-    // 8. Eagerly load small sprite types (<= 15 frames, HUD/props); lazy load big types (>15 frames, characters/t266)
+    // 9. VRAM LRU Eviction & Budget inside GLWrap_
+    const beforeDel = rt;
+    rt = rt.replace(
+      /this\.gl\.deleteTexture\(tex\);\s*\r?\n\t\};/,
+      `tex.c2deleted = true;
+		this.gl.deleteTexture(tex);
+	};
+	var blankPixel1x1 = new Uint8Array([0, 0, 0, 0]);
+	GLWrap_.prototype.evictUnusedTextures = function (forceAll)
+	{
+		var now = Date.now();
+		var VRAM_BUDGET = 80 * 1024 * 1024;
+		var UNUSED_THRESHOLD = 5000;
+		var totalVRAM = 0;
+		var loadedList = [];
+		var i, len, t;
+		for (i = 0, len = all_textures.length; i < len; i++)
+		{
+			t = all_textures[i];
+			if (t && t.c2isLoaded && !t.c2deleted && t.c2lazyLoadFunc)
+			{
+				totalVRAM += (t.c2bytes || (t.c2width * t.c2height * 4) || 1048576);
+				loadedList.push(t);
+			}
+		}
+		if (totalVRAM > VRAM_BUDGET || forceAll)
+		{
+			loadedList.sort(function (a, b) {
+				return (a.c2lastUsedTime || 0) - (b.c2lastUsedTime || 0);
+			});
+			this.endBatch();
+			var gl = this.gl;
+			for (i = 0, len = loadedList.length; i < len; i++)
+			{
+				t = loadedList[i];
+				var age = now - (t.c2lastUsedTime || 0);
+				if (!forceAll && age < UNUSED_THRESHOLD && totalVRAM <= 120 * 1024 * 1024)
+					continue;
+				gl.bindTexture(gl.TEXTURE_2D, t);
+				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, blankPixel1x1);
+				t.c2isLoaded = false;
+				t.c2loading = false;
+				totalVRAM -= (t.c2bytes || (t.c2width * t.c2height * 4) || 1048576);
+				if (t === this.lastTexture0)
+					this.lastTexture0 = null;
+				if (t === this.lastTexture1)
+					this.lastTexture1 = null;
+				if (!forceAll && totalVRAM <= VRAM_BUDGET)
+					break;
+			}
+			gl.bindTexture(gl.TEXTURE_2D, null);
+		}
+	};`
+    );
+    if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture and evictUnusedTextures');
+
+    // 10. Periodic VRAM eviction check in Runtime.prototype.tick
+    const beforeTickSweep = rt;
+    rt = rt.replace(
+      /Runtime\.prototype\.tick\s*=\s*function\s*\(background_wake,\s*timestamp,\s*debug_step\)\s*\{\s*\r?\n\t\tif\s*\(!this\.running_layout\)\s*\r?\n\t\t\treturn;/,
+      `Runtime.prototype.tick = function (background_wake, timestamp, debug_step)
+	{
+		if (!this.running_layout)
+			return;
+		if (this.glwrap && this.glwrap.evictUnusedTextures)
+		{
+			this.__vramCheckCounter = (this.__vramCheckCounter || 0) + 1;
+			if (this.__vramCheckCounter >= 180)
+			{
+				this.__vramCheckCounter = 0;
+				this.glwrap.evictUnusedTextures(false);
+			}
+		}`
+    );
+    if (rt === beforeTickSweep) throw new Error('Failed to patch Runtime.prototype.tick VRAM sweep');
+
+    // 11. Specifically patch typeProto.loadTextures: eagerly load small sprite types (<= 15 frames, HUD/props); lazy load big types
     const beforeLT = rt;
     rt = rt.replace(
-      /for\s*\(i\s*=\s*0,\s*len\s*=\s*this\.all_frames\.length;\s*i\s*<\s*len;\s*\+\+i\)\s*\{\s*frame\s*=\s*this\.all_frames\[i\];\s*frame\.webGL_texture\s*=\s*this\.runtime\.glwrap\.loadTexture\(frame\.texture_img,\s*false,\s*this\.runtime\.linearSampling,\s*frame\.pixelformat\);\s*\}/,
-      `var eager = (this.all_frames.length <= 15);
+      /typeProto\.loadTextures\s*=\s*function\s*\(\)\s*\{\s*\r?\n\t\tif\s*\(this\.is_family\s*\|\|\s*this\.has_loaded_textures\s*\|\|\s*!this\.runtime\.glwrap\)\s*\r?\n\t\t\treturn;\s*\r?\n\t\tvar\s*i,\s*len,\s*frame;\s*\r?\n\t\tfor\s*\(i\s*=\s*0,\s*len\s*=\s*this\.all_frames\.length;\s*i\s*<\s*len;\s*\+\+i\)\s*\{\s*\r?\n\t\t\tframe\s*=\s*this\.all_frames\[i\];\s*\r?\n\t\t\tframe\.webGL_texture\s*=\s*this\.runtime\.glwrap\.loadTexture\(frame\.texture_img,\s*false,\s*this\.runtime\.linearSampling,\s*frame\.pixelformat\);\s*\r?\n\t\t\}\s*\r?\n\t\tthis\.has_loaded_textures\s*=\s*true;\s*\r?\n\t\};/,
+      `typeProto.loadTextures = function ()
+	{
+		if (this.is_family || this.has_loaded_textures || !this.runtime.glwrap)
+			return;
+		var i, len, frame;
+		var eager = (this.all_frames.length <= 15);
 		for (i = 0, len = this.all_frames.length; i < len; ++i)
 		{
 			frame = this.all_frames[i];
@@ -462,13 +560,15 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			if (eager && frame.webGL_texture && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
 			{
 				frame.webGL_texture.c2loading = true;
-				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc);
+				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc, frame.webGL_texture);
 			}
-		}`
+		}
+		this.has_loaded_textures = true;
+	};`
     );
-    if (rt === beforeLT) throw new Error('Failed to patch loadTextures');
+    if (rt === beforeLT) throw new Error('Failed to patch typeProto.loadTextures');
 
-    // 9. Preload active animation frames when a Sprite Instance is created
+    // 12. Preload active animation frames when a Sprite Instance is created
     const beforeInitAnim = rt;
     rt = rt.replace(
       /this\.curFrame\s*=\s*this\.cur_animation\.frames\[this\.cur_frame\];\s*\r?\n\t\tthis\.curWebGLTexture\s*=\s*this\.curFrame\.webGL_texture;\s*\r?\n\t\};/,
@@ -483,7 +583,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (_ctex && !_ctex.c2isLoaded && !_ctex.c2loading && _ctex.c2lazyLoadFunc)
 				{
 					_ctex.c2loading = true;
-					window["__c2EnqueueLazyTex"](_ctex.c2lazyLoadFunc);
+					window["__c2EnqueueLazyTex"](_ctex.c2lazyLoadFunc, _ctex);
 				}
 			}
 		}
@@ -491,7 +591,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeInitAnim) throw new Error('Failed to patch Sprite instance init animation');
 
-    // 10. Preload new animation frames when doChangeAnim runs
+    // 13. Preload new animation frames when doChangeAnim runs
     const beforeDCA = rt;
     rt = rt.replace(
       /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
@@ -503,7 +603,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
 				{
 					_atex.c2loading = true;
-					window["__c2EnqueueLazyTex"](_atex.c2lazyLoadFunc);
+					window["__c2EnqueueLazyTex"](_atex.c2lazyLoadFunc, _atex);
 				}
 			}
 		}
@@ -511,26 +611,73 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeDCA) throw new Error('Failed to patch doChangeAnim');
 
-    // 11. Purge pending texture load queue on layout switch
+    // 14. Audio buffer LRU trimming in getAudioBuffer
+    const beforeAudio = rt;
+    rt = rt.replace(
+      /instanceProto\.getAudioBuffer\s*=\s*function\s*\(src_,\s*is_music,\s*dont_create\)\s*\{\s*\r?\n\t\tvar\s*i,\s*len,\s*a,\s*ret\s*=\s*null,\s*j,\s*k,\s*lenj,\s*ai;/,
+      `window.__c2TrimAudioBuffers = function (forceAll) {
+		for (var ti = audioBuffers.length - 1; ti >= 0; ti--) {
+			var b = audioBuffers[ti];
+			if (b && !b.is_music) {
+				var inUse = false;
+				for (var tj = 0; tj < audioInstances.length; tj++) {
+					var inst = audioInstances[tj];
+					if (inst && inst.buffer === b && inst.canBeRecycled && !inst.canBeRecycled()) {
+						inUse = true;
+						break;
+					}
+				}
+				if (!inUse || forceAll) {
+					b.release();
+					audioBuffers.splice(ti, 1);
+					if (!forceAll && audioBuffers.length <= 15) break;
+				}
+			}
+		}
+	};
+	window.__c2PurgeMemory = function () {
+		var rt = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
+		if (rt && rt.glwrap && rt.glwrap.evictUnusedTextures) {
+			rt.glwrap.evictUnusedTextures(true);
+		}
+		if (window.__c2TrimAudioBuffers) {
+			window.__c2TrimAudioBuffers(true);
+		}
+		if (window.__c2ClearTexQueue) {
+			window.__c2ClearTexQueue();
+		}
+	};
+	instanceProto.getAudioBuffer = function (src_, is_music, dont_create)
+	{
+		var i, len, a, ret = null, j, k, lenj, ai;`
+    );
+    rt = rt.replace(
+      /if\s*\(!ret\s*&&\s*!dont_create\)\s*\{\s*\r?\n\t\t\tif\s*\(playMusicAsSoundWorkaround\s*&&\s*is_music\)\s*\r?\n\t\t\t\tthis\.releaseAllMusicBuffers\(\);\s*\r?\n\t\t\tret\s*=\s*new\s*C2AudioBuffer\(src_,\s*is_music\);\s*\r?\n\t\t\taudioBuffers\.push\(ret\);\s*\r?\n\t\t\}/,
+      `if (!ret && !dont_create)
+		{
+			if (playMusicAsSoundWorkaround && is_music)
+				this.releaseAllMusicBuffers();
+			if (!is_music && audioBuffers.length >= 20 && window.__c2TrimAudioBuffers)
+				window.__c2TrimAudioBuffers(false);
+			ret = new C2AudioBuffer(src_, is_music);
+			audioBuffers.push(ret);
+		}`
+    );
+    if (rt === beforeAudio) throw new Error('Failed to patch AudioBuffer LRU trimming');
+
+    // 15. Purge pending texture load queue & VRAM on layout switch
     const beforeCL = rt;
     rt = rt.replace(
       /this\.running_layout\.stopRunning\(\);/,
-      'this.running_layout.stopRunning();\n\t\tif (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();'
+      `this.running_layout.stopRunning();
+		if (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();
+		if (this.glwrap && this.glwrap.evictUnusedTextures) this.glwrap.evictUnusedTextures(true);
+		if (window["__c2TrimAudioBuffers"]) window["__c2TrimAudioBuffers"](true);`
     );
     if (rt === beforeCL) throw new Error('Failed to patch changeLayout queue purge');
   }
 
-  // 12. Mark deleted textures so queued async loads cancel cleanly
-  if (!rt.includes('tex.c2deleted = true;')) {
-    const beforeDel = rt;
-    rt = rt.replace(
-      'this.gl.deleteTexture(tex);',
-      'tex.c2deleted = true;\n\t\tthis.gl.deleteTexture(tex);'
-    );
-    if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture');
-  }
-
-  // 13. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
+  // 16. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
   if (!rt.includes('_loaderElapsed')) {
     const beforeTick = rt;
     rt = rt.replace(
@@ -596,11 +743,17 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
                 });
             }
         }
-        window.__c2EnqueueLazyTex = function (job) {
+        window.__c2EnqueueLazyTex = function (job, tex) {
+            job.tex = tex;
             texQueue.push(job);
             pumpTexQueue();
         };
         window.__c2ClearTexQueue = function () {
+            for (var i = 0; i < texQueue.length; i++) {
+                if (texQueue[i] && texQueue[i].tex) {
+                    texQueue[i].tex.c2loading = false;
+                }
+            }
             texQueue.length = 0;
         };
 
