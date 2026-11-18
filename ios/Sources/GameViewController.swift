@@ -140,6 +140,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        NSLog("[ZLegends3] Warning: WebContent process terminated by OS (memory pressure). Reloading...")
         webView.reload()
     }
 }

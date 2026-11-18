@@ -95,10 +95,21 @@ function cleanAndroidCordovaFiles(wwwDir) {
 
   // Strip UTF-8 BOM (EF BB BF) from data.js so native WebKit XHR responseType="json" parses cleanly
   const dataJsPath = path.join(wwwDir, 'data.js');
-  const buf = fs.readFileSync(dataJsPath);
+  let buf = fs.readFileSync(dataJsPath);
   if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
-    fs.writeFileSync(dataJsPath, buf.subarray(3));
+    buf = buf.subarray(3);
+    fs.writeFileSync(dataJsPath, buf);
     console.log('  Stripped UTF-8 BOM from data.js.');
+  }
+
+  // Fix button opacity: default instance variable 13 of t240 on Menu Inicial from 100 to 45 (translucent HUD buttons)
+  let dataRaw = buf.toString('utf8');
+  const opacityNeedle = '[[0],[0],[0],[0],[0],[0],[1],[1],[0],[0],[0],[0],[1],[100],[0],[2],[0],[0],[0]]';
+  const opacityRepl = '[[0],[0],[0],[0],[0],[0],[1],[1],[0],[0],[0],[0],[1],[45],[0],[2],[0],[0],[0]]';
+  if (dataRaw.includes(opacityNeedle)) {
+    dataRaw = dataRaw.replace(opacityNeedle, opacityRepl);
+    fs.writeFileSync(dataJsPath, dataRaw, 'utf8');
+    console.log('  Patched default button opacity to 45% (semi-transparent HUD buttons).');
   }
 }
 
@@ -282,8 +293,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 					}`
     );
     if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
+  }
 
-    // 6. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
+  // 6. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
+  if (!rt.includes('c2lazyLoadFunc')) {
     const beforeGL = rt;
     rt = rt.replace(
       /GLWrap_\.prototype\.loadTexture\s*=\s*function\s*\(img,\s*tiling,\s*linearsampling,\s*pixelformat,\s*tiletype,\s*nomip\)\s*\{/,
@@ -342,6 +355,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			webGL_texture.c2refcount = 1;
 			webGL_texture.c2texkey = tex_key;
 			webGL_texture.c2deleted = false;
+			webGL_texture.c2isLoaded = false;
+			webGL_texture.c2loading = false;
 			all_textures.push(webGL_texture);
 			textures_by_src[tex_key] = webGL_texture;
 
@@ -358,47 +373,165 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				}
 			}
 			var selfGL = this;
-			window["__c2EnqueueLazyTex"](function (doneCb) {
-				if (webGL_texture.c2deleted) { doneCb(); return; }
-				var realImg = new Image();
-				realImg.onload = function () {
+			var texSrc = img.cr_src;
+			webGL_texture.c2lazyLoadFunc = function (doneCb) {
+				if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
+					if (doneCb) doneCb();
+					return;
+				}
+				function onUpload(source) {
 					if (!webGL_texture.c2deleted) {
 						selfGL.endBatch();
 						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
 						gl.pixelStorei(gl["UNPACK_PREMULTIPLY_ALPHA_WEBGL"], true);
-						gl.texImage2D(gl.TEXTURE_2D, 0, internalformat, format, type, realImg);
+						gl.texImage2D(gl.TEXTURE_2D, 0, internalformat, format, type, source);
 						gl.bindTexture(gl.TEXTURE_2D, null);
 						selfGL.lastTexture0 = null;
+						webGL_texture.c2isLoaded = true;
+						webGL_texture.c2loading = false;
 						var rtInst = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
 						if (rtInst) rtInst.redraw = true;
 					}
-					realImg.onload = null;
-					realImg.onerror = null;
-					realImg.src = "";
-					doneCb();
-				};
-				realImg.onerror = function () {
-					realImg.onload = null;
-					realImg.onerror = null;
-					realImg.src = "";
-					doneCb();
-				};
-				realImg.src = img.cr_src;
-			});
+					if (doneCb) doneCb();
+				}
+				if (typeof createImageBitmap === "function" && typeof fetch === "function") {
+					fetch(texSrc)
+						.then(function (res) {
+							if (!res.ok) throw new Error("Fetch failed: " + res.status);
+							return res.blob();
+						})
+						.then(function (blob) { return createImageBitmap(blob); })
+						.then(function (bitmap) {
+							onUpload(bitmap);
+							if (bitmap && bitmap.close) bitmap.close();
+						})
+						.catch(function () {
+							fallbackImage();
+						});
+				} else {
+					fallbackImage();
+				}
+				function fallbackImage() {
+					var realImg = new Image();
+					realImg.onload = function () {
+						onUpload(realImg);
+						realImg.onload = null;
+						realImg.onerror = null;
+						realImg.src = "";
+						realImg = null;
+					};
+					realImg.onerror = function () {
+						webGL_texture.c2loading = false;
+						realImg.onload = null;
+						realImg.onerror = null;
+						realImg.src = "";
+						realImg = null;
+						if (doneCb) doneCb();
+					};
+					realImg.src = texSrc;
+				}
+			};
 			return webGL_texture;
 		}`
     );
     if (rt === beforeGL) throw new Error('Failed to patch GLWrap loadTexture');
 
-    // 7. Mark deleted textures so queued async loads cancel cleanly
+    // 7. Load textures on demand when GLWrap_.setTexture is called
+    const beforeST = rt;
+    rt = rt.replace(
+      /GLWrap_\.prototype\.setTexture\s*=\s*function\s*\(tex\)\s*\{/,
+      `GLWrap_.prototype.setTexture = function (tex)
+	{
+		if (tex && !tex.c2isLoaded && !tex.c2loading && tex.c2lazyLoadFunc)
+		{
+			tex.c2loading = true;
+			window["__c2EnqueueLazyTex"](tex.c2lazyLoadFunc);
+		}`
+    );
+    if (rt === beforeST) throw new Error('Failed to patch setTexture');
+
+    // 8. Eagerly load small sprite types (<= 15 frames, HUD/props); lazy load big types (>15 frames, characters/t266)
+    const beforeLT = rt;
+    rt = rt.replace(
+      /for\s*\(i\s*=\s*0,\s*len\s*=\s*this\.all_frames\.length;\s*i\s*<\s*len;\s*\+\+i\)\s*\{\s*frame\s*=\s*this\.all_frames\[i\];\s*frame\.webGL_texture\s*=\s*this\.runtime\.glwrap\.loadTexture\(frame\.texture_img,\s*false,\s*this\.runtime\.linearSampling,\s*frame\.pixelformat\);\s*\}/,
+      `var eager = (this.all_frames.length <= 15);
+		for (i = 0, len = this.all_frames.length; i < len; ++i)
+		{
+			frame = this.all_frames[i];
+			frame.webGL_texture = this.runtime.glwrap.loadTexture(frame.texture_img, false, this.runtime.linearSampling, frame.pixelformat);
+			if (eager && frame.webGL_texture && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
+			{
+				frame.webGL_texture.c2loading = true;
+				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc);
+			}
+		}`
+    );
+    if (rt === beforeLT) throw new Error('Failed to patch loadTextures');
+
+    // 9. Preload active animation frames when a Sprite Instance is created
+    const beforeInitAnim = rt;
+    rt = rt.replace(
+      /this\.curFrame\s*=\s*this\.cur_animation\.frames\[this\.cur_frame\];\s*\r?\n\t\tthis\.curWebGLTexture\s*=\s*this\.curFrame\.webGL_texture;\s*\r?\n\t\};/,
+      `this.curFrame = this.cur_animation.frames[this.cur_frame];
+		this.curWebGLTexture = this.curFrame.webGL_texture;
+		if (this.cur_animation && this.cur_animation.frames)
+		{
+			var _cfs = this.cur_animation.frames;
+			for (var _ci = 0, _clen = _cfs.length; _ci < _clen; _ci++)
+			{
+				var _ctex = _cfs[_ci].webGL_texture;
+				if (_ctex && !_ctex.c2isLoaded && !_ctex.c2loading && _ctex.c2lazyLoadFunc)
+				{
+					_ctex.c2loading = true;
+					window["__c2EnqueueLazyTex"](_ctex.c2lazyLoadFunc);
+				}
+			}
+		}
+	};`
+    );
+    if (rt === beforeInitAnim) throw new Error('Failed to patch Sprite instance init animation');
+
+    // 10. Preload new animation frames when doChangeAnim runs
+    const beforeDCA = rt;
+    rt = rt.replace(
+      /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
+      `if (anim && anim.frames)
+		{
+			for (var _ai = 0, _alen = anim.frames.length; _ai < _alen; _ai++)
+			{
+				var _atex = anim.frames[_ai].webGL_texture;
+				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
+				{
+					_atex.c2loading = true;
+					window["__c2EnqueueLazyTex"](_atex.c2lazyLoadFunc);
+				}
+			}
+		}
+		this.OnFrameChanged(prev_frame, this.cur_animation.frames[this.cur_frame]);`
+    );
+    if (rt === beforeDCA) throw new Error('Failed to patch doChangeAnim');
+
+    // 11. Purge pending texture load queue on layout switch
+    const beforeCL = rt;
+    rt = rt.replace(
+      /this\.running_layout\.stopRunning\(\);/,
+      'this.running_layout.stopRunning();\n\t\tif (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();'
+    );
+    if (rt === beforeCL) throw new Error('Failed to patch changeLayout queue purge');
+  }
+
+  // 12. Mark deleted textures so queued async loads cancel cleanly
+  if (!rt.includes('tex.c2deleted = true;')) {
     const beforeDel = rt;
     rt = rt.replace(
       'this.gl.deleteTexture(tex);',
       'tex.c2deleted = true;\n\t\tthis.gl.deleteTexture(tex);'
     );
     if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture');
+  }
 
-    // 8. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
+  // 13. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
+  if (!rt.includes('_loaderElapsed')) {
     const beforeTick = rt;
     rt = rt.replace(
       /var done = this\.areAllTexturesAndSoundsLoaded\(\);\s*\/\/[^\r\n]*\r?\n\t\t\tthis\.loadingprogress = this\.progress;/,
@@ -449,23 +582,26 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     </style>
     <script>
     (function () {
-        // Throttled on-demand GPU texture loader queue (max 6 concurrent PNG decodes, zero retained CPU bitmaps)
+        // Throttled on-demand GPU texture loader queue (concurrency 2, createImageBitmap zero-RAM retention)
         var texQueue = [];
         var activeTexLoads = 0;
-        var MAX_TEX_CONCURRENCY = 6;
+        var MAX_TEX_CONCURRENCY = 2;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
                 activeTexLoads++;
                 var job = texQueue.shift();
                 job(function () {
                     activeTexLoads--;
-                    pumpTexQueue();
+                    setTimeout(pumpTexQueue, 4);
                 });
             }
         }
         window.__c2EnqueueLazyTex = function (job) {
             texQueue.push(job);
             pumpTexQueue();
+        };
+        window.__c2ClearTexQueue = function () {
+            texQueue.length = 0;
         };
 
         var contexts = [];
