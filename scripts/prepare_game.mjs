@@ -435,19 +435,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
             -webkit-tap-highlight-color: transparent;
         }
         html, body {
-            width: 100%;
-            height: 100%;
             background: #000;
             color: #fff;
             overflow: hidden;
-            position: fixed;
-            inset: 0;
             touch-action: none;
             -ms-touch-action: none;
-        }
-        #c2canvasdiv {
-            width: 100%;
-            height: 100%;
         }
         canvas {
             touch-action: none;
