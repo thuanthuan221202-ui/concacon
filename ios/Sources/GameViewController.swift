@@ -31,7 +31,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         let wv = WKWebView(frame: view.bounds, configuration: config)
         wv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         wv.backgroundColor = .black
-        wv.isOpaque = true
+        wv.isOpaque = false
         wv.allowsBackForwardNavigationGestures = false
         wv.allowsLinkPreview = false
         wv.isMultipleTouchEnabled = true

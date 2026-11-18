@@ -3,7 +3,6 @@ import WebKit
 
 final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
     private let wwwRoot: URL
-    private let lock = NSLock()
     private var activeTasks = Set<ObjectIdentifier>()
     private let ioQueue = DispatchQueue(
         label: "com.geneildosantos.zlegends3.scheme",
@@ -18,112 +17,100 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         let taskID = ObjectIdentifier(urlSchemeTask)
-        lock.lock()
         activeTasks.insert(taskID)
-        lock.unlock()
 
         let req = urlSchemeTask.request
         guard let requestURL = req.url else {
-            failTask(urlSchemeTask, taskID: taskID, code: NSURLErrorBadURL)
+            activeTasks.remove(taskID)
+            urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorBadURL))
             return
         }
         let rangeHeader = req.value(forHTTPHeaderField: "Range")
+        let root = self.wwwRoot
 
         ioQueue.async { [weak self] in
-            self?.serve(url: requestURL, rangeHeader: rangeHeader, task: urlSchemeTask, taskID: taskID)
+            var relPath = requestURL.path
+            while relPath.hasPrefix("/") {
+                relPath.removeFirst()
+            }
+            if relPath.isEmpty {
+                relPath = "index.html"
+            }
+
+            let fileURL = root.appendingPathComponent(relPath).resolvingSymlinksInPath().standardizedFileURL
+            guard fileURL.path.hasPrefix(root.path) else {
+                DispatchQueue.main.async {
+                    guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                    urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorNoPermissionsToReadFile))
+                }
+                return
+            }
+
+            guard FileManager.default.fileExists(atPath: fileURL.path),
+                  let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+                DispatchQueue.main.async {
+                    guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                    let headers = ["Content-Type": "text/plain", "Access-Control-Allow-Origin": "*"]
+                    if let resp = HTTPURLResponse(url: requestURL, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: headers) {
+                        urlSchemeTask.didReceive(resp)
+                        urlSchemeTask.didReceive(Data("Not Found".utf8))
+                        urlSchemeTask.didFinish()
+                    } else {
+                        urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
+                    }
+                }
+                return
+            }
+
+            let mime = Self.mimeType(for: fileURL.pathExtension)
+            let totalLen = data.count
+
+            if let rangeHeader = rangeHeader,
+               let (start, end) = Self.parseRange(header: rangeHeader, totalLength: totalLen) {
+                let slice = data.subdata(in: start..<(end + 1))
+                let headers: [String: String] = [
+                    "Content-Type": mime,
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": "\(slice.count)",
+                    "Content-Range": "bytes \(start)-\(end)/\(totalLen)",
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-cache"
+                ]
+                if let resp = HTTPURLResponse(url: requestURL, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: headers) {
+                    DispatchQueue.main.async {
+                        guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                        urlSchemeTask.didReceive(resp)
+                        urlSchemeTask.didReceive(slice)
+                        urlSchemeTask.didFinish()
+                    }
+                    return
+                }
+            }
+
+            let headers: [String: String] = [
+                "Content-Type": mime,
+                "Accept-Ranges": "bytes",
+                "Content-Length": "\(totalLen)",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-cache"
+            ]
+            let response = HTTPURLResponse(url: requestURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
+            DispatchQueue.main.async {
+                guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                if let response = response {
+                    urlSchemeTask.didReceive(response)
+                    urlSchemeTask.didReceive(data)
+                    urlSchemeTask.didFinish()
+                } else {
+                    urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotParseResponse))
+                }
+            }
         }
     }
 
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         let taskID = ObjectIdentifier(urlSchemeTask)
-        lock.lock()
         activeTasks.remove(taskID)
-        lock.unlock()
-    }
-
-    private func serve(url: URL, rangeHeader: String?, task: WKURLSchemeTask, taskID: ObjectIdentifier) {
-        var relPath = url.path
-        while relPath.hasPrefix("/") {
-            relPath.removeFirst()
-        }
-        if relPath.isEmpty {
-            relPath = "index.html"
-        }
-
-        let fileURL = wwwRoot.appendingPathComponent(relPath).resolvingSymlinksInPath().standardizedFileURL
-        guard fileURL.path.hasPrefix(wwwRoot.path) else {
-            failTask(task, taskID: taskID, code: NSURLErrorNoPermissionsToReadFile)
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: fileURL.path),
-              let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
-            sendNotFound(url: url, task: task, taskID: taskID)
-            return
-        }
-
-        let mime = Self.mimeType(for: fileURL.pathExtension)
-        let totalLen = data.count
-
-        if let rangeHeader = rangeHeader,
-           let (start, end) = Self.parseRange(header: rangeHeader, totalLength: totalLen) {
-            let slice = data.subdata(in: start..<(end + 1))
-            let headers: [String: String] = [
-                "Content-Type": mime,
-                "Accept-Ranges": "bytes",
-                "Content-Length": "\(slice.count)",
-                "Content-Range": "bytes \(start)-\(end)/\(totalLen)",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache"
-            ]
-            if let resp = HTTPURLResponse(url: url, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: headers) {
-                finishWithData(task: task, taskID: taskID, response: resp, data: slice)
-                return
-            }
-        }
-
-        let headers: [String: String] = [
-            "Content-Type": mime,
-            "Accept-Ranges": "bytes",
-            "Content-Length": "\(totalLen)",
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "no-cache"
-        ]
-        guard let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers) else {
-            failTask(task, taskID: taskID, code: NSURLErrorCannotParseResponse)
-            return
-        }
-        finishWithData(task: task, taskID: taskID, response: response, data: data)
-    }
-
-    private func finishWithData(task: WKURLSchemeTask, taskID: ObjectIdentifier, response: URLResponse, data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard activeTasks.remove(taskID) != nil else { return }
-        task.didReceive(response)
-        task.didReceive(data)
-        task.didFinish()
-    }
-
-    private func sendNotFound(url: URL, task: WKURLSchemeTask, taskID: ObjectIdentifier) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard activeTasks.remove(taskID) != nil else { return }
-        let headers = ["Content-Type": "text/plain", "Access-Control-Allow-Origin": "*"]
-        if let resp = HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: headers) {
-            task.didReceive(resp)
-            task.didReceive(Data("Not Found".utf8))
-            task.didFinish()
-        } else {
-            task.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
-        }
-    }
-
-    private func failTask(_ task: WKURLSchemeTask, taskID: ObjectIdentifier, code: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard activeTasks.remove(taskID) != nil else { return }
-        task.didFailWithError(NSError(domain: NSURLErrorDomain, code: code))
     }
 
     private static func parseRange(header: String, totalLength: Int) -> (Int, Int)? {

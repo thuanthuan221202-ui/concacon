@@ -32,7 +32,7 @@ function fixMojibake(name) {
 }
 
 function extractApkWithPython(apkPath, iosDir) {
-  console.log(`[1/6] Extracting assets/www and app icon from APK: ${apkPath}`);
+  console.log(`[1/7] Extracting assets/www and app icon from APK: ${apkPath}`);
   const pyScript = `
 import sys, os, zipfile, shutil
 
@@ -76,7 +76,7 @@ with zipfile.ZipFile(apk_path, "r") as z:
 }
 
 function cleanAndroidCordovaFiles(wwwDir) {
-  console.log('[2/6] Removing Android-specific Cordova wrapper files...');
+  console.log('[2/7] Removing Android-specific Cordova wrapper files & stripping BOM from data.js...');
   const toRemove = [
     'cordova.js',
     'cordova_plugins.js',
@@ -92,10 +92,40 @@ function cleanAndroidCordovaFiles(wwwDir) {
       fs.rmSync(p, { recursive: true, force: true });
     }
   }
+
+  // Strip UTF-8 BOM (EF BB BF) from data.js so native WebKit XHR responseType="json" parses cleanly
+  const dataJsPath = path.join(wwwDir, 'data.js');
+  const buf = fs.readFileSync(dataJsPath);
+  if (buf.length >= 3 && buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) {
+    fs.writeFileSync(dataJsPath, buf.subarray(3));
+    console.log('  Stripped UTF-8 BOM from data.js.');
+  }
+}
+
+function generateImageDimensionsMap(wwwDir) {
+  console.log('[3/7] Generating precomputed PNG dimensions map (img_dims.js) for zero-RAM lazy texture streaming...');
+  const imgDir = path.join(wwwDir, 'images');
+  const dims = {};
+  const files = fs.readdirSync(imgDir).filter(f => f.toLowerCase().endsWith('.png'));
+  for (const f of files) {
+    const fd = fs.openSync(path.join(imgDir, f), 'r');
+    const hdr = Buffer.alloc(24);
+    fs.readSync(fd, hdr, 0, 24, 0);
+    fs.closeSync(fd);
+    const w = hdr.readUInt32BE(16);
+    const h = hdr.readUInt32BE(20);
+    dims[`images/${f}`] = [w, h];
+  }
+  fs.writeFileSync(
+    path.join(wwwDir, 'img_dims.js'),
+    `window.__C2_IMG_DIMS = ${JSON.stringify(dims)};\n`,
+    'utf8'
+  );
+  console.log(`  Indexed dimensions for ${files.length} sprite sheets.`);
 }
 
 function normalizeMediaFilenames(mediaDir) {
-  console.log('[3/6] Normalizing media filenames (UTF-8 NFC + lowercase for iOS APFS)...');
+  console.log('[4/7] Normalizing media filenames (UTF-8 NFC + lowercase for iOS APFS)...');
   const files = fs.readdirSync(mediaDir);
   let renamed = 0;
   for (const f of files) {
@@ -108,7 +138,6 @@ function normalizeMediaFilenames(mediaDir) {
       const src = path.join(mediaDir, f);
       const tmp = path.join(mediaDir, `__tmp_${Date.now()}_${Math.random().toString(36).slice(2)}_${clean}`);
       const dst = path.join(mediaDir, clean);
-      // Two-step rename so case-only renames work on case-insensitive filesystems (macOS/Windows) too
       fs.renameSync(src, tmp);
       fs.renameSync(tmp, dst);
       renamed++;
@@ -119,11 +148,15 @@ function normalizeMediaFilenames(mediaDir) {
 
 async function convertAudioToM4a(mediaDir, skipAudio) {
   if (skipAudio) {
-    console.log('[4/6] Skipping ffmpeg audio conversion (--skip-audio set).');
+    console.log('[5/7] Skipping ffmpeg audio conversion (--skip-audio set).');
     return;
   }
   const files = fs.readdirSync(mediaDir).filter(f => /\.(ogg|mp3)$/i.test(f));
-  console.log(`[4/6] Converting ${files.length} audio files (.ogg/.mp3 -> Apple AAC .m4a)...`);
+  if (files.length === 0) {
+    console.log('[5/7] Audio files already converted to .m4a.');
+    return;
+  }
+  console.log(`[5/7] Converting ${files.length} audio files (.ogg/.mp3 -> Apple AAC .m4a)...`);
 
   const concurrency = Math.max(4, Math.min(12, os.cpus().length * 2));
   let idx = 0;
@@ -141,28 +174,18 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
 
       try {
         await execFileAsync('ffmpeg', [
-          '-nostdin',
-          '-y',
-          '-loglevel', 'error',
+          '-nostdin', '-y', '-loglevel', 'error',
           '-i', inPath,
-          '-vn',
-          '-c:a', 'aac',
-          '-b:a', '128k',
-          '-movflags', '+faststart',
+          '-vn', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
           outPath,
         ]);
       } catch (err) {
         fallbacks++;
         console.warn(`  [warn] Fallback silent audio for ${file}: ${err.message}`);
         await execFileAsync('ffmpeg', [
-          '-nostdin',
-          '-y',
-          '-loglevel', 'error',
-          '-f', 'lavfi',
-          '-i', 'anullsrc=r=44100:cl=stereo',
-          '-t', '0.1',
-          '-c:a', 'aac',
-          '-b:a', '64k',
+          '-nostdin', '-y', '-loglevel', 'error',
+          '-f', 'lavfi', '-i', 'anullsrc=r=44100:cl=stereo', '-t', '0.1',
+          '-c:a', 'aac', '-b:a', '64k',
           outPath,
         ]);
       }
@@ -179,19 +202,19 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
   console.log(`  Audio conversion complete (${completed} .m4a files, ${fallbacks} fallbacks).`);
 }
 
-function patchConstruct2Runtime(wwwDir) {
-  console.log('[5/6] Patching Construct 2 runtime & index.html for iOS WKWebView...');
+export function patchConstruct2RuntimeAndHtml(wwwDir) {
+  console.log('[6/7] Patching Construct 2 runtime (iOS WebKit Jetsam RAM fix + on-demand GPU texture streaming)...');
   const rtPath = path.join(wwwDir, 'c2runtime.js');
   let rt = fs.readFileSync(rtPath, 'utf8');
 
-  // 1. Detect modern iPadOS 13+ (where navigator.userAgent reports MacIntel with touch points)
+  // 1. iPadOS 13+ detection
   if (!rt.includes('navigator.maxTouchPoints > 1')) {
     const before = rt;
     rt = rt.replace(
       'this.isiPad = /ipad/i.test(navigator.userAgent);',
       'this.isiPad = /ipad/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);'
     );
-    if (rt === before) throw new Error('Failed to patch isiPad detection in c2runtime.js');
+    if (rt === before) throw new Error('Failed to patch isiPad detection');
   }
 
   // 2. Route Music tracks through WebAudio API XMLHttpRequest on iOS custom scheme
@@ -201,17 +224,193 @@ function patchConstruct2Runtime(wwwDir) {
       /if\s*\(this\.runtime\.isWKWebView\)\s*playMusicAsSoundWorkaround\s*=\s*true;/,
       'if (this.runtime.isWKWebView || this.runtime.isiOS) playMusicAsSoundWorkaround = true;'
     );
-    if (rt === before) throw new Error('Failed to patch playMusicAsSoundWorkaround in c2runtime.js');
+    if (rt === before) throw new Error('Failed to patch playMusicAsSoundWorkaround');
   }
 
-  // 3. Always use hardware-decoded .m4a (AAC) on iOS
+  // 3. Always use hardware-decoded .m4a (AAC)
   if (rt.includes('audio/ogg; codecs="vorbis"')) {
     const before = rt;
     rt = rt.replace(
       /useOgg\s*=\s*!!\s*\(new Audio\(\)\.canPlayType\([^)]+\)\)\s*&&\s*!this\.runtime\.isWindows10;/,
       'useOgg = false;'
     );
-    if (rt === before) throw new Error('Failed to patch useOgg in c2runtime.js');
+    if (rt === before) throw new Error('Failed to patch useOgg');
+  }
+
+  // 4. Mark deferred non-loader-layout type initialization so 620 heavy character/stage sprite sheets
+  //    are NOT decoded into 1.75 GB of CPU HTMLImageElement RAM at startup (prevents iOS WebContent Jetsam OOM crash!)
+  if (!rt.includes('this.__inDeferredTypeInit = true;')) {
+    const before = rt;
+    rt = rt.replace(
+      /if\s*\(this\.uses_loader_layout\)\s*\{\s*for\s*\(i\s*=\s*0,\s*len\s*=\s*this\.types_by_index\.length;\s*i\s*<\s*len;\s*i\+\+\)/,
+      'if (this.uses_loader_layout) {\n\t\t\tthis.__inDeferredTypeInit = true;\n\t\t\tfor (i = 0, len = this.types_by_index.length; i < len; i++)'
+    );
+    rt = rt.replace(
+      /\}\s*else\s*this\.isloading\s*=\s*false;\s*for\s*\(i\s*=\s*0,\s*len\s*=\s*this\.layouts_by_index\.length;/,
+      '\tthis.__inDeferredTypeInit = false;\n\t\t}\n\t\telse\n\t\t\tthis.isloading = false;\n\t\tfor (i = 0, len = this.layouts_by_index.length;'
+    );
+    if (rt === before) throw new Error('Failed to patch __inDeferredTypeInit');
+  }
+
+  // 5. Replace eager new Image() in Sprite.Type.prototype.onCreate with lightweight lazy descriptor when deferred
+  if (!rt.includes('__isLazyProxy')) {
+    const before = rt;
+    rt = rt.replace(
+      /frameobj\.texture_img\s*=\s*new Image\(\);\s*frameobj\.texture_img\.cr_src\s*=\s*frame\[0\];\s*frameobj\.texture_img\.cr_filesize\s*=\s*frame\[1\];\s*frameobj\.texture_img\.c2webGL_texture\s*=\s*null;\s*this\.runtime\.waitForImageLoad\(frameobj\.texture_img,\s*frame\[0\]\);/,
+      `if (this.runtime.__inDeferredTypeInit) {
+						var _dims = (window["__C2_IMG_DIMS"] && window["__C2_IMG_DIMS"][frame[0]]) || [256, 256];
+						frameobj.texture_img = {
+							cr_src: frame[0],
+							cr_filesize: frame[1],
+							c2webGL_texture: null,
+							src: frame[0],
+							width: _dims[0],
+							height: _dims[1],
+							naturalWidth: _dims[0],
+							naturalHeight: _dims[1],
+							complete: true,
+							c2error: false,
+							__isLazyProxy: true
+						};
+						this.runtime.wait_for_textures.push(frameobj.texture_img);
+					} else {
+						frameobj.texture_img = new Image();
+						frameobj.texture_img.cr_src = frame[0];
+						frameobj.texture_img.cr_filesize = frame[1];
+						frameobj.texture_img.c2webGL_texture = null;
+						this.runtime.waitForImageLoad(frameobj.texture_img, frame[0]);
+					}`
+    );
+    if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
+
+    // 6. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
+    const beforeGL = rt;
+    rt = rt.replace(
+      /GLWrap_\.prototype\.loadTexture\s*=\s*function\s*\(img,\s*tiling,\s*linearsampling,\s*pixelformat,\s*tiletype,\s*nomip\)\s*\{/,
+      `GLWrap_.prototype.loadTexture = function (img, tiling, linearsampling, pixelformat, tiletype, nomip)
+	{
+		if (img && img.__isLazyProxy)
+		{
+			tiling = !!tiling;
+			linearsampling = !!linearsampling;
+			var tex_key = img.cr_src + "," + tiling + "," + linearsampling + (tiling ? ("," + tiletype) : "");
+			var webGL_texture = null;
+			if (textures_by_src.hasOwnProperty(tex_key))
+			{
+				webGL_texture = textures_by_src[tex_key];
+				webGL_texture.c2refcount++;
+				return webGL_texture;
+			}
+			this.endBatch();
+			var gl = this.gl;
+			webGL_texture = gl.createTexture();
+			gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
+			gl.pixelStorei(gl["UNPACK_PREMULTIPLY_ALPHA_WEBGL"], false);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+			if (tiling)
+			{
+				if (tiletype === "repeat-x") {
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+				} else if (tiletype === "repeat-y") {
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+				} else {
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+					gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+				}
+			}
+			else
+			{
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+			}
+			if (linearsampling)
+			{
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+			}
+			else
+			{
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+				gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+			}
+			gl.bindTexture(gl.TEXTURE_2D, null);
+			this.lastTexture0 = null;
+			webGL_texture.c2width = img.width;
+			webGL_texture.c2height = img.height;
+			webGL_texture.c2refcount = 1;
+			webGL_texture.c2texkey = tex_key;
+			webGL_texture.c2deleted = false;
+			all_textures.push(webGL_texture);
+			textures_by_src[tex_key] = webGL_texture;
+
+			var internalformat = gl.RGBA;
+			var format = gl.RGBA;
+			var type = gl.UNSIGNED_BYTE;
+			if (pixelformat && !this.isIE)
+			{
+				switch (pixelformat) {
+				case BF_RGB8: internalformat = gl.RGB; format = gl.RGB; break;
+				case BF_RGBA4: type = gl.UNSIGNED_SHORT_4_4_4_4; break;
+				case BF_RGB5_A1: type = gl.UNSIGNED_SHORT_5_5_5_1; break;
+				case BF_RGB565: internalformat = gl.RGB; format = gl.RGB; type = gl.UNSIGNED_SHORT_5_6_5; break;
+				}
+			}
+			var selfGL = this;
+			window["__c2EnqueueLazyTex"](function (doneCb) {
+				if (webGL_texture.c2deleted) { doneCb(); return; }
+				var realImg = new Image();
+				realImg.onload = function () {
+					if (!webGL_texture.c2deleted) {
+						selfGL.endBatch();
+						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
+						gl.pixelStorei(gl["UNPACK_PREMULTIPLY_ALPHA_WEBGL"], true);
+						gl.texImage2D(gl.TEXTURE_2D, 0, internalformat, format, type, realImg);
+						gl.bindTexture(gl.TEXTURE_2D, null);
+						selfGL.lastTexture0 = null;
+						var rtInst = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
+						if (rtInst) rtInst.redraw = true;
+					}
+					realImg.onload = null;
+					realImg.onerror = null;
+					realImg.src = "";
+					doneCb();
+				};
+				realImg.onerror = function () {
+					realImg.onload = null;
+					realImg.onerror = null;
+					realImg.src = "";
+					doneCb();
+				};
+				realImg.src = img.cr_src;
+			});
+			return webGL_texture;
+		}`
+    );
+    if (rt === beforeGL) throw new Error('Failed to patch GLWrap loadTexture');
+
+    // 7. Mark deleted textures so queued async loads cancel cleanly
+    const beforeDel = rt;
+    rt = rt.replace(
+      'this.gl.deleteTexture(tex);',
+      'tex.c2deleted = true;\n\t\tthis.gl.deleteTexture(tex);'
+    );
+    if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture');
+
+    // 8. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
+    const beforeTick = rt;
+    rt = rt.replace(
+      /var done = this\.areAllTexturesAndSoundsLoaded\(\);\s*\/\/[^\r\n]*\r?\n\t\t\tthis\.loadingprogress = this\.progress;/,
+      `var done = this.areAllTexturesAndSoundsLoaded();
+			var _loaderElapsed = Date.now() - this.start_time;
+			if (_loaderElapsed < 1500) {
+				done = false;
+				this.progress = Math.min(0.99, _loaderElapsed / 1500);
+			}
+			this.loadingprogress = this.progress;`
+    );
+    if (rt === beforeTick) throw new Error('Failed to patch loader progress tick');
   }
 
   fs.writeFileSync(rtPath, rt, 'utf8');
@@ -258,6 +457,25 @@ function patchConstruct2Runtime(wwwDir) {
     </style>
     <script>
     (function () {
+        // Throttled on-demand GPU texture loader queue (max 6 concurrent PNG decodes, zero retained CPU bitmaps)
+        var texQueue = [];
+        var activeTexLoads = 0;
+        var MAX_TEX_CONCURRENCY = 6;
+        function pumpTexQueue() {
+            while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
+                activeTexLoads++;
+                var job = texQueue.shift();
+                job(function () {
+                    activeTexLoads--;
+                    pumpTexQueue();
+                });
+            }
+        }
+        window.__c2EnqueueLazyTex = function (job) {
+            texQueue.push(job);
+            pumpTexQueue();
+        };
+
         var contexts = [];
         var OrigAC = window.AudioContext || window.webkitAudioContext;
         if (OrigAC) {
@@ -293,6 +511,7 @@ function patchConstruct2Runtime(wwwDir) {
     <div id="c2canvasdiv">
         <canvas id="c2canvas" width="1084" height="580"></canvas>
     </div>
+    <script src="img_dims.js"></script>
     <script src="jquery-3.4.1.min.js"></script>
     <script src="c2runtime.js"></script>
     <script>
@@ -354,11 +573,8 @@ async function generateAppIcons(iosDir, wwwDir, skipAudio) {
     for (const px of uniquePx) {
       const outPng = path.join(iconsetDir, `icon-${px}.png`);
       await execFileAsync('ffmpeg', [
-        '-nostdin',
-        '-y',
-        '-loglevel', 'error',
-        '-f', 'lavfi',
-        '-i', `color=c=black:s=${px}x${px}`,
+        '-nostdin', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', `color=c=black:s=${px}x${px}`,
         '-i', srcIcon,
         '-filter_complex', `[1:v]scale=${px}:${px}:flags=neighbor[fg];[0:v][fg]overlay=0:0,format=rgb24`,
         '-frames:v', '1',
@@ -381,7 +597,7 @@ async function generateAppIcons(iosDir, wwwDir, skipAudio) {
 }
 
 function verifyAssets(wwwDir, skipAudio) {
-  console.log('[6/6] Verifying 100% of game audio & image references...');
+  console.log('[7/7] Verifying 100% of game audio & image references...');
   const raw = fs.readFileSync(path.join(wwwDir, 'data.js'), 'utf8');
 
   const audioRe = /\[2,\["([^"]+)",(true|false)\]\]/g;
@@ -411,27 +627,31 @@ function verifyAssets(wwwDir, skipAudio) {
   console.log(`  Verified OK: ${audioRefs.size} audio references & ${imgRefs.size} sprite sheets matched 100%!`);
 }
 
-async function main() {
-  const opts = parseArgs(process.argv);
-  const iosDir = path.resolve(opts.iosDir);
-  const wwwDir = path.join(iosDir, 'www');
+export { cleanAndroidCordovaFiles, generateImageDimensionsMap, verifyAssets };
 
-  if (opts.apk) {
-    extractApkWithPython(path.resolve(opts.apk), iosDir);
-  } else if (!fs.existsSync(path.join(wwwDir, 'data.js'))) {
-    throw new Error(`Neither --apk provided nor ${path.join(wwwDir, 'data.js')} found.`);
-  }
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
+if (isMain) {
+  (async () => {
+    const opts = parseArgs(process.argv);
+    const iosDir = path.resolve(opts.iosDir);
+    const wwwDir = path.join(iosDir, 'www');
 
-  cleanAndroidCordovaFiles(wwwDir);
-  normalizeMediaFilenames(path.join(wwwDir, 'media'));
-  await convertAudioToM4a(path.join(wwwDir, 'media'), opts.skipAudio);
-  patchConstruct2Runtime(wwwDir);
-  await generateAppIcons(iosDir, wwwDir, opts.skipAudio);
-  verifyAssets(wwwDir, opts.skipAudio);
-  console.log('Game preparation completed successfully!');
+    if (opts.apk) {
+      extractApkWithPython(path.resolve(opts.apk), iosDir);
+    } else if (!fs.existsSync(path.join(wwwDir, 'data.js'))) {
+      throw new Error(`Neither --apk provided nor ${path.join(wwwDir, 'data.js')} found.`);
+    }
+
+    cleanAndroidCordovaFiles(wwwDir);
+    generateImageDimensionsMap(wwwDir);
+    normalizeMediaFilenames(path.join(wwwDir, 'media'));
+    await convertAudioToM4a(path.join(wwwDir, 'media'), opts.skipAudio);
+    patchConstruct2RuntimeAndHtml(wwwDir);
+    await generateAppIcons(iosDir, wwwDir, opts.skipAudio);
+    verifyAssets(wwwDir, opts.skipAudio);
+    console.log('Game preparation completed successfully!');
+  })().catch(err => {
+    console.error('FATAL:', err);
+    process.exit(1);
+  });
 }
-
-main().catch(err => {
-  console.error('FATAL:', err);
-  process.exit(1);
-});
