@@ -884,6 +884,52 @@
         document.getElementById("z3-btn-do-import").onclick = importSaveData;
         document.getElementById("z3-btn-redeem").onclick = redeemGiftcode;
 
+        // 1. Stop all touch/pointer/mouse events on btn and overlay from bubbling to document/canvas (fixes background click leakage)
+        var stopTouchEvents = [
+            "touchstart", "touchmove", "touchend", "touchcancel",
+            "pointerdown", "pointermove", "pointerup", "pointercancel",
+            "mousedown", "mousemove", "mouseup",
+            "click", "dblclick", "contextmenu"
+        ];
+        stopTouchEvents.forEach(function (ev) {
+            btn.addEventListener(ev, function (e) {
+                e.stopPropagation();
+            }, { capture: true, passive: false });
+            overlay.addEventListener(ev, function (e) {
+                e.stopPropagation();
+            }, { capture: true, passive: false });
+        });
+
+        // 2. Stop keyboard events from bubbling to document/C2 Keyboard plugin (fixes letter 'G' block)
+        var stopKeyEvents = ["keydown", "keyup", "keypress"];
+        stopKeyEvents.forEach(function (ev) {
+            overlay.addEventListener(ev, function (e) {
+                e.stopPropagation();
+            }, { capture: true, passive: false });
+        });
+
+        // 3. Attach keyboard and touch shield to all input and textarea elements explicitly
+        var inputElements = overlay.querySelectorAll("input, textarea");
+        inputElements.forEach(function (el) {
+            stopKeyEvents.forEach(function (ev) {
+                el.addEventListener(ev, function (e) {
+                    e.stopPropagation();
+                }, { capture: true, passive: false });
+            });
+            stopTouchEvents.forEach(function (ev) {
+                el.addEventListener(ev, function (e) {
+                    e.stopPropagation();
+                }, { capture: true, passive: false });
+            });
+        });
+
+        var giftInput = document.getElementById("z3-giftcode-input");
+        if (giftInput) {
+            giftInput.addEventListener("input", function () {
+                this.value = this.value.toUpperCase();
+            });
+        }
+
         updateTriggerButtonVisibility();
     }
 

@@ -413,6 +413,9 @@
     resize: none;
     box-sizing: border-box;
     word-break: break-all;
+    -webkit-user-select: text !important;
+    user-select: text !important;
+    -webkit-touch-callout: default !important;
 }
 
 .z3-textarea:focus {
@@ -475,6 +478,9 @@
     color: #fff;
     text-transform: uppercase;
     letter-spacing: 1px;
+    -webkit-user-select: text !important;
+    user-select: text !important;
+    -webkit-touch-callout: default !important;
 }
 
 .z3-input:focus {

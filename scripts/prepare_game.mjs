@@ -720,6 +720,78 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === beforeLF) throw new Error('Failed to patch LocalStorage localforage exposure');
   }
 
+  // 18. Isolate Z-Hub touch/mouse and keyboard events so modal interactions never leak to background or block inputs (e.g. key 'G')
+  if (!rt.includes('__z3IsBlockedTarget')) {
+    const helperFn = `
+	function __z3IsBlockedTarget(info) {
+		var t = info && info.target;
+		if (t && (t.id === "z3-trigger-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-trigger-btn") || t.closest("#z3-modal-overlay")))))
+			return true;
+		var m = document.getElementById("z3-modal-overlay");
+		if (m && m.classList && m.classList.contains("active"))
+			return true;
+		return false;
+	}
+	`;
+
+    // Patch Keyboard.prototype.Instance onKeyDown and onKeyUp
+    const beforeKD = rt;
+    rt = rt.replace(
+      /instanceProto\.onKeyDown\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tvar alreadyPreventedDefault = false;/,
+      `instanceProto.onKeyDown = function (info)
+	{
+		var _t = info && info.target;
+		if (_t && (_t.tagName === "INPUT" || _t.tagName === "TEXTAREA" || _t.isContentEditable))
+			return;
+		var _m = document.getElementById("z3-modal-overlay");
+		if (_m && _m.classList && _m.classList.contains("active"))
+			return;
+		var alreadyPreventedDefault = false;`
+    );
+    if (rt === beforeKD) throw new Error('Failed to patch Keyboard onKeyDown');
+
+    rt = rt.replace(
+      /instanceProto\.onKeyUp\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tthis\.keyMap\[info\.which\] = false;/,
+      `instanceProto.onKeyUp = function (info)
+	{
+		var _t = info && info.target;
+		if (_t && (_t.tagName === "INPUT" || _t.tagName === "TEXTAREA" || _t.isContentEditable))
+			return;
+		var _m = document.getElementById("z3-modal-overlay");
+		if (_m && _m.classList && _m.classList.contains("active"))
+			return;
+		this.keyMap[info.which] = false;`
+    );
+
+    // Patch Touch.prototype.Instance onPointerStart, onTouchStart, onMouseDown
+    const beforeTouch = rt;
+    rt = rt.replace(
+      /instanceProto\.onPointerStart\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tif\s*\(info\["pointerType"\] === info\["MSPOINTER_TYPE_MOUSE"\] \|\| info\["pointerType"\] === "mouse"\)\s*\r?\n\t\t\treturn;/,
+      `${helperFn}instanceProto.onPointerStart = function (info)
+	{
+		if (__z3IsBlockedTarget(info)) return;
+		if (info["pointerType"] === info["MSPOINTER_TYPE_MOUSE"] || info["pointerType"] === "mouse")
+			return;`
+    );
+    rt = rt.replace(
+      /instanceProto\.onTouchStart\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tif\s*\(info\.preventDefault && cr\.isCanvasInputEvent\(info\)\)\s*\r?\n\t\t\tinfo\.preventDefault\(\);/,
+      `instanceProto.onTouchStart = function (info)
+	{
+		if (__z3IsBlockedTarget(info)) return;
+		if (info.preventDefault && cr.isCanvasInputEvent(info))
+			info.preventDefault();`
+    );
+    rt = rt.replace(
+      /instanceProto\.onMouseDown\s*=\s*function\(info\)\s*\{\s*\r?\n\t\tif\s*\(isCompatibilityMouseEvent\(info\)\)\s*\r?\n\t\t\treturn;/,
+      `instanceProto.onMouseDown = function(info)
+	{
+		if (__z3IsBlockedTarget(info)) return;
+		if (isCompatibilityMouseEvent(info))
+			return;`
+    );
+    if (rt === beforeTouch) throw new Error('Failed to patch Touch input listeners');
+  }
+
   fs.writeFileSync(rtPath, rt, 'utf8');
 
   const indexHtml = `<!DOCTYPE html>
