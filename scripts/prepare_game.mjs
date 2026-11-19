@@ -4,6 +4,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const execFileAsync = promisify(execFile);
 
@@ -542,6 +546,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				this.__vramCheckCounter = 0;
 				this.glwrap.evictUnusedTextures(false);
 			}
+		}
+		if (window["__z3CheckMenuVisibility"])
+		{
+			window["__z3CheckMenuVisibility"](this.running_layout.name);
 		}`
     );
     if (rt === beforeTickSweep) throw new Error('Failed to patch Runtime.prototype.tick VRAM sweep');
@@ -675,7 +683,13 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       `this.running_layout.stopRunning();
 		if (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();
 		if (this.glwrap && this.glwrap.evictUnusedTextures) this.glwrap.evictUnusedTextures(true);
-		if (window["__c2TrimAudioBuffers"]) window["__c2TrimAudioBuffers"](true);`
+		if (window["__c2TrimAudioBuffers"]) window["__c2TrimAudioBuffers"](true);
+		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"]("");`
+    );
+    rt = rt.replace(
+      /this\.running_layout\.startRunning\(\);/,
+      `this.running_layout.startRunning();
+		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"](this.running_layout.name);`
     );
     if (rt === beforeCL) throw new Error('Failed to patch changeLayout queue purge');
   }
@@ -696,6 +710,16 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === beforeTick) throw new Error('Failed to patch loader progress tick');
   }
 
+  // 17. Expose Construct 2 LocalForage storage for Z-Hub backup and mini-game
+  if (!rt.includes('window["__c2LocalForage"] = localforage;')) {
+    const beforeLF = rt;
+    rt = rt.replace(
+      /var pluginProto = cr\.plugins_\.LocalStorage\.prototype;/,
+      'if (typeof localforage !== "undefined") window["__c2LocalForage"] = localforage;\n\tvar pluginProto = cr.plugins_.LocalStorage.prototype;'
+    );
+    if (rt === beforeLF) throw new Error('Failed to patch LocalStorage localforage exposure');
+  }
+
   fs.writeFileSync(rtPath, rt, 'utf8');
 
   const indexHtml = `<!DOCTYPE html>
@@ -708,6 +732,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <link rel="apple-touch-icon" sizes="256x256" href="icon-256.png" />
+    <link rel="stylesheet" href="z3_hub.css" />
     <style type="text/css">
         * {
             padding: 0;
@@ -811,6 +836,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     <script src="img_dims.js"></script>
     <script src="jquery-3.4.1.min.js"></script>
     <script src="c2runtime.js"></script>
+    <script src="z3_hub.js"></script>
     <script>
         jQuery(window).resize(function () {
             cr_sizeCanvas(jQuery(window).width(), jQuery(window).height());
@@ -828,6 +854,16 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 </html>
 `;
   fs.writeFileSync(path.join(wwwDir, 'index.html'), indexHtml, 'utf8');
+
+  // Copy Z-Hub overlay assets into www
+  const hubCssSrc = path.join(__dirname, 'z3_hub.css');
+  const hubJsSrc = path.join(__dirname, 'z3_hub.js');
+  if (fs.existsSync(hubCssSrc)) {
+    fs.copyFileSync(hubCssSrc, path.join(wwwDir, 'z3_hub.css'));
+  }
+  if (fs.existsSync(hubJsSrc)) {
+    fs.copyFileSync(hubJsSrc, path.join(wwwDir, 'z3_hub.js'));
+  }
 }
 
 async function generateAppIcons(iosDir, wwwDir, skipAudio) {
