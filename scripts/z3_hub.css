@@ -38,6 +38,8 @@
     user-select: none;
     -webkit-user-select: none;
     touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    pointer-events: auto;
     transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.2s ease;
 }
 
@@ -70,6 +72,7 @@
     color: var(--z3-text);
     padding: env(safe-area-inset-top, 8px) env(safe-area-inset-right, 12px) env(safe-area-inset-bottom, 8px) env(safe-area-inset-left, 12px);
     box-sizing: border-box;
+    pointer-events: auto;
 }
 
 #z3-modal-overlay.active {

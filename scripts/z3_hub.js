@@ -88,8 +88,10 @@
     }, 60);
 
     // Instant hide on menu touch
-    document.addEventListener("pointerdown", function (e) {
-        if (e.target && (e.target.id === "z3-trigger-btn" || e.target.closest("#z3-trigger-btn") || e.target.closest("#z3-modal-overlay"))) {
+    function handleOutsideTouch(e) {
+        var t = e.target;
+        if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
+        if (t && (t.id === "z3-trigger-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-trigger-btn") || t.closest("#z3-modal-overlay"))))) {
             return;
         }
         requestAnimationFrame(function () {
@@ -97,7 +99,9 @@
         });
         setTimeout(updateTriggerButtonVisibility, 60);
         setTimeout(updateTriggerButtonVisibility, 180);
-    }, { capture: true, passive: true });
+    }
+    document.addEventListener("pointerdown", handleOutsideTouch, { capture: true, passive: true });
+    document.addEventListener("touchstart", handleOutsideTouch, { capture: true, passive: true });
 
     // Web Audio Synthesizer (Zero asset dependencies)
     var audioCtx = null;
@@ -766,7 +770,6 @@
         var btn = document.createElement("button");
         btn.id = "z3-trigger-btn";
         btn.innerHTML = "<span class=\"z3-star-icon\">★</span> 🐉 Z-HUB";
-        btn.onclick = openModal;
         document.body.appendChild(btn);
 
         // Toast
@@ -852,22 +855,65 @@
 
         document.body.appendChild(overlay);
 
-        // Event Listeners
-        document.getElementById("z3-close-x-btn").onclick = closeModal;
-        overlay.onclick = function (e) {
-            if (e.target === overlay) closeModal();
-        };
+        // Reliable tap + click handler for iOS touch & desktop mouse with 350ms debounce
+        function addTapListener(el, handler) {
+            if (!el) return;
+            var lastTriggerTime = 0;
+            function triggerAction(e) {
+                var now = Date.now();
+                if (now - lastTriggerTime < 350) return;
+                lastTriggerTime = now;
+                if (e) {
+                    e.stopPropagation();
+                    if (e.type === "touchend" && e.cancelable) e.preventDefault();
+                }
+                handler(e);
+            }
+            el.addEventListener("click", triggerAction, false);
+            el.addEventListener("touchend", triggerAction, false);
+        }
 
-        var tabBtns = overlay.querySelectorAll(".z3-tab-btn");
-        tabBtns.forEach(function (tBtn) {
-            tBtn.onclick = function () {
-                var idx = parseInt(tBtn.getAttribute("data-tab"), 10);
-                switchTab(idx);
-            };
+        // Attach reliable tap listener to Trigger Button
+        addTapListener(btn, openModal);
+
+        // Stop pointer & touch start/move on btn from bubbling to canvas/document (bubble phase)
+        var btnStopEvents = [
+            "touchstart", "touchmove",
+            "pointerdown", "pointermove",
+            "mousedown", "mousemove"
+        ];
+        btnStopEvents.forEach(function (ev) {
+            btn.addEventListener(ev, function (e) {
+                e.stopPropagation();
+            }, false);
         });
 
-        document.getElementById("z3-spin-main-btn").onclick = startSpin;
-        document.getElementById("z3-buy-spin-btn").onclick = async function () {
+        // Close modal button
+        var closeXBtn = document.getElementById("z3-close-x-btn");
+        addTapListener(closeXBtn, closeModal);
+
+        // Backdrop tap to close modal (only if tapping the dark background itself)
+        function onBackdropTap(e) {
+            if (e.target === overlay) {
+                if (e.type === "touchend" && e.cancelable) e.preventDefault();
+                closeModal();
+            }
+        }
+        overlay.addEventListener("click", onBackdropTap, false);
+        overlay.addEventListener("touchend", onBackdropTap, false);
+
+        // Tabs
+        var tabBtns = overlay.querySelectorAll(".z3-tab-btn");
+        tabBtns.forEach(function (tBtn) {
+            addTapListener(tBtn, function () {
+                var idx = parseInt(tBtn.getAttribute("data-tab"), 10);
+                switchTab(idx);
+            });
+        });
+
+        // Wheel and Shop buttons
+        addTapListener(document.getElementById("z3-spin-main-btn"), startSpin);
+        addTapListener(document.getElementById("z3-buy-spin-btn"), async function () {
             var bp = await getLiveBP();
             if (bp < 200) {
                 showToast("Bạn cần ít nhất 200 BP để đổi thêm lượt quay!");
@@ -878,48 +924,42 @@
             await storageSet("Z3_WHEEL_FREE_SPINS", curRem + 1);
             showToast("Đã đổi thành công 1 lượt quay (+1 lượt)!");
             updateWheelUI();
-        };
+        });
 
-        document.getElementById("z3-btn-do-export").onclick = exportSaveData;
-        document.getElementById("z3-btn-do-import").onclick = importSaveData;
-        document.getElementById("z3-btn-redeem").onclick = redeemGiftcode;
+        // Account / Save data buttons
+        addTapListener(document.getElementById("z3-btn-do-export"), exportSaveData);
+        addTapListener(document.getElementById("z3-btn-do-import"), importSaveData);
+        addTapListener(document.getElementById("z3-btn-redeem"), redeemGiftcode);
 
-        // 1. Stop all touch/pointer/mouse events on btn and overlay from bubbling to document/canvas (fixes background click leakage)
-        var stopTouchEvents = [
+        // Stop all pointer/touch/mouse events bubbling UP through overlay to document/canvas
+        // (Uses bubble phase { capture: false }, so children inside overlay receive their clicks freely)
+        var overlayStopEvents = [
             "touchstart", "touchmove", "touchend", "touchcancel",
             "pointerdown", "pointermove", "pointerup", "pointercancel",
             "mousedown", "mousemove", "mouseup",
             "click", "dblclick", "contextmenu"
         ];
-        stopTouchEvents.forEach(function (ev) {
-            btn.addEventListener(ev, function (e) {
-                e.stopPropagation();
-            }, { capture: true, passive: false });
+        overlayStopEvents.forEach(function (ev) {
             overlay.addEventListener(ev, function (e) {
                 e.stopPropagation();
-            }, { capture: true, passive: false });
+            }, false);
         });
 
-        // 2. Stop keyboard events from bubbling to document/C2 Keyboard plugin (fixes letter 'G' block)
+        // Stop keyboard events from bubbling to document/C2 Keyboard plugin (fixes letter 'G' block)
         var stopKeyEvents = ["keydown", "keyup", "keypress"];
         stopKeyEvents.forEach(function (ev) {
             overlay.addEventListener(ev, function (e) {
                 e.stopPropagation();
-            }, { capture: true, passive: false });
+            }, false);
         });
 
-        // 3. Attach keyboard and touch shield to all input and textarea elements explicitly
+        // Attach keyboard shield to all input and textarea elements explicitly
         var inputElements = overlay.querySelectorAll("input, textarea");
         inputElements.forEach(function (el) {
             stopKeyEvents.forEach(function (ev) {
                 el.addEventListener(ev, function (e) {
                     e.stopPropagation();
-                }, { capture: true, passive: false });
-            });
-            stopTouchEvents.forEach(function (ev) {
-                el.addEventListener(ev, function (e) {
-                    e.stopPropagation();
-                }, { capture: true, passive: false });
+                }, false);
             });
         });
 
