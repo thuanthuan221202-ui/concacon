@@ -725,7 +725,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     const helperFn = `
 	function __z3IsBlockedTarget(info) {
 		var t = info && info.target;
-		if (t && (t.id === "z3-trigger-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-trigger-btn") || t.closest("#z3-modal-overlay")))))
+		if (t && (t.id === "z3-dock-bar" || t.id === "z3-clean-btn" || t.id === "z3-trigger-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-dock-bar") || t.closest("#z3-clean-btn") || t.closest("#z3-trigger-btn") || t.closest("#z3-modal-overlay")))))
 			return true;
 		var m = document.getElementById("z3-modal-overlay");
 		if (m && m.classList && m.classList.contains("active"))

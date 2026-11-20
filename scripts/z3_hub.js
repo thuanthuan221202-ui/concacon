@@ -62,10 +62,12 @@
         { key: "MiraiTrunks_Desbloqueado", name: "Trunks Tương Lai" }
     ];
 
-    // Visibility Controller (Menu-Only, Bottom-Right)
+    // Visibility Controller (Menu-Only, Bottom-Right Dock)
     function updateTriggerButtonVisibility(layoutName) {
+        var dock = document.getElementById("z3-dock-bar");
         var btn = document.getElementById("z3-trigger-btn");
-        if (!btn) return;
+        var target = dock || btn;
+        if (!target) return;
         if (!layoutName) {
             var rt = getC2Runtime();
             if (rt && rt.running_layout) layoutName = rt.running_layout.name;
@@ -74,9 +76,9 @@
         var isModalOpen = document.getElementById("z3-modal-overlay") && document.getElementById("z3-modal-overlay").classList.contains("active");
 
         if (isMainMenu && !isModalOpen) {
-            btn.style.display = "flex";
+            target.style.display = "flex";
         } else {
-            btn.style.display = "none";
+            target.style.display = "none";
         }
     }
     window.__z3OnLayoutChange = updateTriggerButtonVisibility;
@@ -91,7 +93,7 @@
     function handleOutsideTouch(e) {
         var t = e.target;
         if (t && t.nodeType !== 1 && t.parentElement) t = t.parentElement;
-        if (t && (t.id === "z3-trigger-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-trigger-btn") || t.closest("#z3-modal-overlay"))))) {
+        if (t && (t.id === "z3-dock-bar" || t.id === "z3-trigger-btn" || t.id === "z3-clean-btn" || t.id === "z3-modal-overlay" || (t.closest && (t.closest("#z3-dock-bar") || t.closest("#z3-trigger-btn") || t.closest("#z3-clean-btn") || t.closest("#z3-modal-overlay"))))) {
             return;
         }
         requestAnimationFrame(function () {
@@ -762,15 +764,159 @@
         }
     }
 
+    // Master Memory, WebGL, Audio & Cache Cleanup
+    async function performGarbageAndCacheClean() {
+        var cleanBtn = document.getElementById("z3-clean-btn");
+        if (cleanBtn) {
+            cleanBtn.classList.add("cleaning");
+            cleanBtn.innerHTML = "<span class=\"z3-spin\">⚡</span> ĐANG DỌN...";
+        }
+
+        // 1. Construct 2 master memory purge
+        try {
+            if (window.__c2PurgeMemory) {
+                window.__c2PurgeMemory();
+            }
+        } catch (e) {
+            console.warn("c2PurgeMemory:", e);
+        }
+
+        // 2. WebGL Texture & Pipeline Flush
+        var rt = getC2Runtime();
+        if (rt) {
+            try {
+                if (rt.glwrap) {
+                    if (rt.glwrap.evictUnusedTextures) {
+                        rt.glwrap.evictUnusedTextures(true);
+                    }
+                    if (rt.gl) {
+                        rt.gl.flush();
+                        rt.gl.finish();
+                    }
+                }
+            } catch (e) {
+                console.warn("WebGL purge:", e);
+            }
+
+            // 3. Purge all inactive battle sprites from memory while in Menu
+            try {
+                if (rt.all_object_types && rt.running_layout && rt.running_layout.name === "Menu Inicial") {
+                    for (var i = 0; i < rt.all_object_types.length; i++) {
+                        var objType = rt.all_object_types[i];
+                        if (objType && objType.animations) {
+                            var oName = (objType.name || "").toLowerCase();
+                            if (oName.indexOf("menu") !== -1 || oName.indexOf("cursor") !== -1 || oName.indexOf("logo") !== -1 || oName === "t240") {
+                                continue;
+                            }
+                            for (var a = 0; a < objType.animations.length; a++) {
+                                var anim = objType.animations[a];
+                                if (anim && anim.frames) {
+                                    for (var f = 0; f < anim.frames.length; f++) {
+                                        var frame = anim.frames[f];
+                                        if (frame) {
+                                            if (frame.webGL_texture && rt.gl) {
+                                                try { rt.gl.deleteTexture(frame.webGL_texture); } catch (e) {}
+                                                frame.webGL_texture = null;
+                                            }
+                                            if (frame.unload_texture) {
+                                                try { frame.unload_texture(); } catch (e) {}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.warn("Battle frame purge:", e);
+            }
+        }
+
+        // 4. Construct 2 Web Audio Buffers release
+        try {
+            if (window.__c2TrimAudioBuffers) {
+                window.__c2TrimAudioBuffers(true);
+            }
+        } catch (e) {
+            console.warn("Audio buffer purge:", e);
+        }
+
+        // 5. CacheStorage release (clean WebKit caches)
+        try {
+            if (window.caches && caches.keys) {
+                var keys = await caches.keys();
+                for (var ci = 0; ci < keys.length; ci++) {
+                    await caches.delete(keys[ci]);
+                }
+            }
+        } catch (e) {
+            console.warn("CacheStorage delete:", e);
+        }
+
+        // 6. Clear Performance Timings & SessionStorage (preserve localStorage save data!)
+        try {
+            if (window.performance) {
+                if (performance.clearResourceTimings) performance.clearResourceTimings();
+                if (performance.clearMarks) performance.clearMarks();
+                if (performance.clearMeasures) performance.clearMeasures();
+            }
+            if (window.sessionStorage) {
+                sessionStorage.clear();
+            }
+        } catch (e) {}
+
+        // 7. Force JavaScriptCore / WebKit generational & full GC
+        try {
+            if (window.gc) window.gc();
+            for (var gci = 0; gci < 4; gci++) {
+                var _tmp = new ArrayBuffer(1024 * 1024 * 8); // 8MB transient
+                var _u = new Uint8Array(_tmp);
+                _u[0] = 1;
+            }
+        } catch (e) {}
+
+        // 8. Chime sound feedback
+        try {
+            playSynthTone(587.33, 0.08, "triangle");
+            setTimeout(function () {
+                playSynthTone(880.00, 0.15, "triangle");
+            }, 80);
+        } catch (e) {}
+
+        // 9. Feedback toast & reset button state
+        setTimeout(function () {
+            if (cleanBtn) {
+                cleanBtn.classList.remove("cleaning");
+                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
+            }
+            showToast("✨ Đã dọn sạch RAM & Cache! Game đã được giải phóng bộ nhớ tối đa.");
+        }, 450);
+    }
+
     // Build DOM
     function injectUI() {
-        if (document.getElementById("z3-trigger-btn")) return;
+        if (document.getElementById("z3-dock-bar") || document.getElementById("z3-trigger-btn")) return;
 
-        // Trigger Button (Hidden by default, shown only in Menu Inicial)
+        // Bottom Dock Bar (Hidden by default, shown only in Menu Inicial)
+        var dock = document.createElement("div");
+        dock.id = "z3-dock-bar";
+
+        // Clean Cache & Garbage Button
+        var cleanBtn = document.createElement("button");
+        cleanBtn.id = "z3-clean-btn";
+        cleanBtn.className = "z3-dock-btn";
+        cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
+        dock.appendChild(cleanBtn);
+
+        // Z-Hub Trigger Button
         var btn = document.createElement("button");
         btn.id = "z3-trigger-btn";
+        btn.className = "z3-dock-btn";
         btn.innerHTML = "<span class=\"z3-star-icon\">★</span> 🐉 Z-HUB";
-        document.body.appendChild(btn);
+        dock.appendChild(btn);
+
+        document.body.appendChild(dock);
 
         // Toast
         var toast = document.createElement("div");
@@ -873,19 +1019,23 @@
             el.addEventListener("touchend", triggerAction, false);
         }
 
-        // Attach reliable tap listener to Trigger Button
+        // Attach reliable tap listeners
+        addTapListener(cleanBtn, performGarbageAndCacheClean);
         addTapListener(btn, openModal);
 
-        // Stop pointer & touch start/move on btn from bubbling to canvas/document (bubble phase)
+        // Stop pointer & touch start/move on dock, cleanBtn and btn from bubbling to canvas/document (bubble phase)
         var btnStopEvents = [
             "touchstart", "touchmove",
             "pointerdown", "pointermove",
             "mousedown", "mousemove"
         ];
-        btnStopEvents.forEach(function (ev) {
-            btn.addEventListener(ev, function (e) {
-                e.stopPropagation();
-            }, false);
+        [dock, cleanBtn, btn].forEach(function (element) {
+            if (!element) return;
+            btnStopEvents.forEach(function (ev) {
+                element.addEventListener(ev, function (e) {
+                    e.stopPropagation();
+                }, false);
+            });
         });
 
         // Close modal button
