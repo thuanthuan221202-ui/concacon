@@ -1123,9 +1123,17 @@
         updateTriggerButtonVisibility();
     }
 
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", injectUI);
-    } else {
+    function safeInjectUI() {
+        if (!document.body) {
+            document.addEventListener("DOMContentLoaded", safeInjectUI);
+            return;
+        }
         injectUI();
+    }
+
+    if (document.readyState === "loading" || !document.body) {
+        document.addEventListener("DOMContentLoaded", safeInjectUI);
+    } else {
+        safeInjectUI();
     }
 })();
