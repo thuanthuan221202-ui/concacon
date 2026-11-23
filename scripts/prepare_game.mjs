@@ -188,12 +188,36 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
       const outPath = path.join(mediaDir, `${base}.m4a`);
 
       try {
-        await execFileAsync('ffmpeg', [
+        // For huge looping OST BGM tracks (> 1.8MB source, typically 5-9 min -> 120-202MB WebAudio Float32 RAM!),
+        // cap at 120s with a smooth 3s fade-out into Construct 2's seamless loop -> saves up to 158MB permanent RAM!
+        const srcSize = fs.statSync(inPath).size;
+        let ffmpegArgs = [
           '-nostdin', '-y', '-loglevel', 'error',
           '-i', inPath,
           '-vn', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
           outPath,
-        ]);
+        ];
+        if (srcSize > 1800 * 1024) {
+          let durSec = 0;
+          try {
+            await execFileAsync('ffmpeg', ['-i', inPath]);
+          } catch (probeErr) {
+            const stderr = probeErr.stderr ? probeErr.stderr.toString() : '';
+            const dm = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+            if (dm) durSec = Number(dm[1]) * 3600 + Number(dm[2]) * 60 + Number(dm[3]);
+          }
+          if (durSec > 150) {
+            ffmpegArgs = [
+              '-nostdin', '-y', '-loglevel', 'error',
+              '-i', inPath,
+              '-t', '120',
+              '-af', 'afade=t=out:st=117:d=3',
+              '-vn', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              outPath,
+            ];
+          }
+        }
+        await execFileAsync('ffmpeg', ffmpegArgs);
       } catch (err) {
         fallbacks++;
         console.warn(`  [warn] Fallback silent audio for ${file}: ${err.message}`);
@@ -511,7 +535,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	GLWrap_.prototype.evictUnusedTextures = function (forceAll, incomingBytes)
 	{
 		var now = Date.now();
-		var VRAM_BUDGET = 96 * 1024 * 1024;
+		var SOFT_BUDGET = 96 * 1024 * 1024;
+		var HARD_CEILING = 128 * 1024 * 1024;
+		var HARD_TARGET = 104 * 1024 * 1024;
 		var UNUSED_THRESHOLD = incomingBytes ? 8000 : 12000;
 		var totalVRAM = incomingBytes || 0;
 		var loadedList = [];
@@ -525,32 +551,61 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				loadedList.push(t);
 			}
 		}
-		if (totalVRAM > VRAM_BUDGET || forceAll)
+		if (totalVRAM > SOFT_BUDGET || forceAll)
 		{
 			loadedList.sort(function (a, b) {
 				return (a.c2lastUsedTime || 0) - (b.c2lastUsedTime || 0);
 			});
 			this.endBatch();
 			var gl = this.gl;
+			var evictedCount = 0;
+			function evictOne(texObj) {
+				gl.bindTexture(gl.TEXTURE_2D, texObj);
+				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, blankPixel1x1);
+				texObj.c2isLoaded = false;
+				texObj.c2loading = false;
+				totalVRAM -= (texObj.c2bytes || (texObj.c2width * texObj.c2height * 4) || 1048576);
+				evictedCount++;
+				if (texObj === selfGLRef.lastTexture0)
+					selfGLRef.lastTexture0 = null;
+				if (texObj === selfGLRef.lastTexture1)
+					selfGLRef.lastTexture1 = null;
+			}
+			var selfGLRef = this;
+			// Pass 1: Smooth eviction (only textures idle >= 8s/12s -> zero active character flicker)
 			for (i = 0, len = loadedList.length; i < len; i++)
 			{
 				t = loadedList[i];
 				var age = now - (t.c2lastUsedTime || 0);
 				if (!forceAll && age < UNUSED_THRESHOLD)
 					continue;
-				gl.bindTexture(gl.TEXTURE_2D, t);
-				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, blankPixel1x1);
-				t.c2isLoaded = false;
-				t.c2loading = false;
-				totalVRAM -= (t.c2bytes || (t.c2width * t.c2height * 4) || 1048576);
-				if (t === this.lastTexture0)
-					this.lastTexture0 = null;
-				if (t === this.lastTexture1)
-					this.lastTexture1 = null;
-				if (!forceAll && totalVRAM <= VRAM_BUDGET)
+				evictOne(t);
+				if (!forceAll && totalVRAM <= SOFT_BUDGET)
 					break;
 			}
+			// Pass 2: Hard Emergency Ceiling during heavy 5-7 sheet Special/Ultimate/Cutscene bursts!
+			// Never let VRAM exceed 128MB: evict textures not drawn in last 400ms down to 104MB
+			if (!forceAll && totalVRAM > HARD_CEILING)
+			{
+				for (i = 0, len = loadedList.length; i < len; i++)
+				{
+					t = loadedList[i];
+					if (!t.c2isLoaded)
+						continue;
+					var age2 = now - (t.c2lastUsedTime || 0);
+					if (age2 < 400)
+						continue;
+					evictOne(t);
+					if (totalVRAM <= HARD_TARGET)
+						break;
+				}
+			}
 			gl.bindTexture(gl.TEXTURE_2D, null);
+			// Immediately commit 1x1 replacements to Apple Metal driver so evicted 16MB GPU pages are freed NOW
+			if (evictedCount > 0)
+			{
+				gl.flush();
+			}
 		}
 	};
 	GLWrap_.prototype.evictForBudget = function (incomingBytes)
