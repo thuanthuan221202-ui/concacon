@@ -299,17 +299,27 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
   }
 
-  // 6. Cap DevicePixelRatio to 2.0 to prevent 3x Super Retina framebuffer VRAM explosion
-  if (!rt.includes('Math.min(2.0, (this.isRetina')) {
+  // 6. Cap DevicePixelRatio (1.5 normal, 1.0 in Low-RAM Shield mode) to prevent Retina framebuffer VRAM explosion
+  if (!rt.includes('__z3LowRamMode ? 1.0 : 1.5')) {
     const beforeDpr = rt;
     rt = rt.replace(
       'this.devicePixelRatio = (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1);',
-      'this.devicePixelRatio = Math.min(2.0, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
+      'this.devicePixelRatio = Math.min((window["__z3LowRamMode"] ? 1.0 : 1.5), (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
     );
     if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
   }
 
-  // 7. On-demand WebGL texture upload + immediate CPU bitmap eviction in GLWrap_.prototype.loadTexture
+  // 6b. Release XHR reference immediately after loadProject so 58MB data.js buffer is freed by GC
+  if (!rt.includes('xhr.onload = null; xhr.onerror = null;')) {
+    const beforeXhr = rt;
+    rt = rt.replace(
+      /self\.loadProject\(xhr\["response"\]\);\s*\/\/ already parsed by browser/,
+      'var _resp = xhr["response"]; xhr.onload = null; xhr.onerror = null; xhr = null; self.loadProject(_resp); _resp = null;'
+    );
+    if (rt === beforeXhr) console.warn('  [warn] Optional XHR cleanup pattern not matched');
+  }
+
+  // 7. On-demand WebGL texture upload + Synchronous Pre-Upload Eviction + 50% Low-RAM Downscale (-75% VRAM!)
   if (!rt.includes('c2lazyLoadFunc')) {
     const beforeGL = rt;
     rt = rt.replace(
@@ -390,19 +400,31 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 			var selfGL = this;
 			var texSrc = img.cr_src;
+			var origW = img.width || 256;
+			var origH = img.height || 256;
 			webGL_texture.c2lazyLoadFunc = function (doneCb) {
 				if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
 					if (doneCb) doneCb();
 					return;
 				}
+				var lowRam = !!window["__z3LowRamMode"];
+				var shouldDownscale = lowRam && (origW >= 1024 || origH >= 1024);
+				var targetW = shouldDownscale ? Math.max(1, Math.round(origW * 0.5)) : origW;
+				var targetH = shouldDownscale ? Math.max(1, Math.round(origH * 0.5)) : origH;
+				var uploadBytes = targetW * targetH * 4;
+
 				function onUpload(source) {
 					if (!webGL_texture.c2deleted) {
+						if (selfGL.evictForBudget) {
+							selfGL.evictForBudget(uploadBytes);
+						}
 						selfGL.endBatch();
 						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
 						gl.pixelStorei(gl["UNPACK_PREMULTIPLY_ALPHA_WEBGL"], true);
 						gl.texImage2D(gl.TEXTURE_2D, 0, internalformat, format, type, source);
 						gl.bindTexture(gl.TEXTURE_2D, null);
 						selfGL.lastTexture0 = null;
+						webGL_texture.c2bytes = uploadBytes;
 						webGL_texture.c2isLoaded = true;
 						webGL_texture.c2loading = false;
 						webGL_texture.c2lastUsedTime = Date.now();
@@ -411,16 +433,55 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 					}
 					if (doneCb) doneCb();
 				}
+				function downscaleAndUpload(srcImg) {
+					if (!shouldDownscale) {
+						onUpload(srcImg);
+						return;
+					}
+					try {
+						var tmpC = window["__z3ResizeCanvas"];
+						if (!tmpC) {
+							tmpC = document.createElement("canvas");
+							window["__z3ResizeCanvas"] = tmpC;
+						}
+						tmpC.width = targetW;
+						tmpC.height = targetH;
+						var tmpCtx = tmpC.getContext("2d");
+						tmpCtx.imageSmoothingEnabled = false;
+						tmpCtx.clearRect(0, 0, targetW, targetH);
+						tmpCtx.drawImage(srcImg, 0, 0, targetW, targetH);
+						onUpload(tmpC);
+						tmpC.width = 1;
+						tmpC.height = 1;
+					} catch (e) {
+						onUpload(srcImg);
+					}
+				}
 				if (typeof createImageBitmap === "function" && typeof fetch === "function") {
 					fetch(texSrc, { cache: "no-store" })
 						.then(function (res) {
 							if (!res.ok) throw new Error("Fetch failed: " + res.status);
 							return res.blob();
 						})
-						.then(function (blob) { return createImageBitmap(blob); })
+						.then(function (blob) {
+							if (shouldDownscale) {
+								return createImageBitmap(blob, {
+									resizeWidth: targetW,
+									resizeHeight: targetH,
+									resizeQuality: "pixelated"
+								}).catch(function () {
+									return createImageBitmap(blob);
+								});
+							}
+							return createImageBitmap(blob);
+						})
 						.then(function (bitmap) {
 							try {
-								onUpload(bitmap);
+								if (shouldDownscale && (bitmap.width > targetW || bitmap.height > targetH)) {
+									downscaleAndUpload(bitmap);
+								} else {
+									onUpload(bitmap);
+								}
 							} finally {
 								if (bitmap && bitmap.close) bitmap.close();
 							}
@@ -434,7 +495,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				function fallbackImage() {
 					var realImg = new Image();
 					realImg.onload = function () {
-						onUpload(realImg);
+						downscaleAndUpload(realImg);
 						realImg.onload = null;
 						realImg.onerror = null;
 						realImg.src = "";
@@ -474,7 +535,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeST) throw new Error('Failed to patch setTexture');
 
-    // 9. VRAM LRU Eviction & Budget inside GLWrap_
+    // 9. Strict Synchronous VRAM LRU Eviction & Dynamic Budget inside GLWrap_ (44MB normal / 24MB Low-RAM Shield)
     const beforeDel = rt;
     rt = rt.replace(
       /this\.gl\.deleteTexture\(tex\);\s*\r?\n\t\};/,
@@ -482,12 +543,23 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		this.gl.deleteTexture(tex);
 	};
 	var blankPixel1x1 = new Uint8Array([0, 0, 0, 0]);
-	GLWrap_.prototype.evictUnusedTextures = function (forceAll)
+	GLWrap_.prototype.getEstimatedVRAM = function ()
+	{
+		var total = 0;
+		for (var i = 0, len = all_textures.length; i < len; i++)
+		{
+			var t = all_textures[i];
+			if (t && t.c2isLoaded && !t.c2deleted && t.c2lazyLoadFunc)
+				total += (t.c2bytes || (t.c2width * t.c2height * 4) || 1048576);
+		}
+		return total;
+	};
+	GLWrap_.prototype.evictUnusedTextures = function (forceAll, incomingBytes)
 	{
 		var now = Date.now();
-		var VRAM_BUDGET = 80 * 1024 * 1024;
-		var UNUSED_THRESHOLD = 4000;
-		var totalVRAM = 0;
+		var VRAM_BUDGET = (window["__z3LowRamMode"] ? 24 : 44) * 1024 * 1024;
+		var UNUSED_THRESHOLD = incomingBytes ? 250 : 2000;
+		var totalVRAM = incomingBytes || 0;
 		var loadedList = [];
 		var i, len, t;
 		for (i = 0, len = all_textures.length; i < len; i++)
@@ -526,11 +598,15 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 			gl.bindTexture(gl.TEXTURE_2D, null);
 		}
+	};
+	GLWrap_.prototype.evictForBudget = function (incomingBytes)
+	{
+		this.evictUnusedTextures(false, incomingBytes || 0);
 	};`
     );
     if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture and evictUnusedTextures');
 
-    // 10. Periodic VRAM eviction check in Runtime.prototype.tick
+    // 10. Periodic VRAM eviction check in Runtime.prototype.tick (every 60 ticks ~1s)
     const beforeTickSweep = rt;
     rt = rt.replace(
       /Runtime\.prototype\.tick\s*=\s*function\s*\(background_wake,\s*timestamp,\s*debug_step\)\s*\{\s*\r?\n\t\tif\s*\(!this\.running_layout\)\s*\r?\n\t\t\treturn;/,
@@ -541,7 +617,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (this.glwrap && this.glwrap.evictUnusedTextures)
 		{
 			this.__vramCheckCounter = (this.__vramCheckCounter || 0) + 1;
-			if (this.__vramCheckCounter >= 120)
+			if (this.__vramCheckCounter >= 60)
 			{
 				this.__vramCheckCounter = 0;
 				this.glwrap.evictUnusedTextures(false);
@@ -554,7 +630,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeTickSweep) throw new Error('Failed to patch Runtime.prototype.tick VRAM sweep');
 
-    // 11. Specifically patch typeProto.loadTextures: eagerly load small sprite types (<= 15 frames, HUD/props); lazy load big types
+    // 11. Patch typeProto.loadTextures: pure on-demand loading (only tiny <=4 frame UI icons < 1MB load eagerly)
     const beforeLT = rt;
     rt = rt.replace(
       /typeProto\.loadTextures\s*=\s*function\s*\(\)\s*\{\s*\r?\n\t\tif\s*\(this\.is_family\s*\|\|\s*this\.has_loaded_textures\s*\|\|\s*!this\.runtime\.glwrap\)\s*\r?\n\t\t\treturn;\s*\r?\n\t\tvar\s*i,\s*len,\s*frame;\s*\r?\n\t\tfor\s*\(i\s*=\s*0,\s*len\s*=\s*this\.all_frames\.length;\s*i\s*<\s*len;\s*\+\+i\)\s*\{\s*\r?\n\t\t\tframe\s*=\s*this\.all_frames\[i\];\s*\r?\n\t\t\tframe\.webGL_texture\s*=\s*this\.runtime\.glwrap\.loadTexture\(frame\.texture_img,\s*false,\s*this\.runtime\.linearSampling,\s*frame\.pixelformat\);\s*\r?\n\t\t\}\s*\r?\n\t\tthis\.has_loaded_textures\s*=\s*true;\s*\r?\n\t\};/,
@@ -563,12 +639,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (this.is_family || this.has_loaded_textures || !this.runtime.glwrap)
 			return;
 		var i, len, frame;
-		var eager = (this.all_frames.length <= 15);
+		var tinyType = (this.all_frames.length <= 4);
 		for (i = 0, len = this.all_frames.length; i < len; ++i)
 		{
 			frame = this.all_frames[i];
 			frame.webGL_texture = this.runtime.glwrap.loadTexture(frame.texture_img, false, this.runtime.linearSampling, frame.pixelformat);
-			if (eager && frame.webGL_texture && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
+			if (tinyType && frame.webGL_texture && (frame.webGL_texture.c2bytes || 0) <= 1048576 && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
 			{
 				frame.webGL_texture.c2loading = true;
 				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc, frame.webGL_texture);
@@ -579,36 +655,16 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeLT) throw new Error('Failed to patch typeProto.loadTextures');
 
-    // 12. Preload active animation frames when a Sprite Instance is created
-    const beforeInitAnim = rt;
-    rt = rt.replace(
-      /this\.curFrame\s*=\s*this\.cur_animation\.frames\[this\.cur_frame\];\s*\r?\n\t\tthis\.curWebGLTexture\s*=\s*this\.curFrame\.webGL_texture;\s*\r?\n\t\};/,
-      `this.curFrame = this.cur_animation.frames[this.cur_frame];
-		this.curWebGLTexture = this.curFrame.webGL_texture;
-		if (this.cur_animation && this.cur_animation.frames)
-		{
-			var _cfs = this.cur_animation.frames;
-			for (var _ci = 0, _clen = _cfs.length; _ci < _clen; _ci++)
-			{
-				var _ctex = _cfs[_ci].webGL_texture;
-				if (_ctex && !_ctex.c2isLoaded && !_ctex.c2loading && _ctex.c2lazyLoadFunc)
-				{
-					_ctex.c2loading = true;
-					window["__c2EnqueueLazyTex"](_ctex.c2lazyLoadFunc, _ctex);
-				}
-			}
-		}
-	};`
-    );
-    if (rt === beforeInitAnim) throw new Error('Failed to patch Sprite instance init animation');
+    // 12. (Removed eager anim[0] preload on Sprite create — prevents 170MB invisible/Special VRAM spike at battle start!)
 
-    // 13. Preload new animation frames when doChangeAnim runs
+    // 13. Preload max 2 upcoming frames in doChangeAnim ONLY if instance is visible
     const beforeDCA = rt;
     rt = rt.replace(
       /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
-      `if (anim && anim.frames)
+      `if (this.visible && this.opacity > 0 && anim && anim.frames)
 		{
-			for (var _ai = 0, _alen = anim.frames.length; _ai < _alen; _ai++)
+			var _maxPre = Math.min(anim.frames.length, 2);
+			for (var _ai = 0; _ai < _maxPre; _ai++)
 			{
 				var _atex = anim.frames[_ai].webGL_texture;
 				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
@@ -622,11 +678,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeDCA) throw new Error('Failed to patch doChangeAnim');
 
-    // 14. Audio buffer LRU trimming in getAudioBuffer
+    // 14. Audio buffer LRU trimming in getAudioBuffer + aggressive __c2PurgeMemory
     const beforeAudio = rt;
     rt = rt.replace(
       /instanceProto\.getAudioBuffer\s*=\s*function\s*\(src_,\s*is_music,\s*dont_create\)\s*\{\s*\r?\n\t\tvar\s*i,\s*len,\s*a,\s*ret\s*=\s*null,\s*j,\s*k,\s*lenj,\s*ai;/,
       `window.__c2TrimAudioBuffers = function (forceAll) {
+		var keepLimit = window["__z3LowRamMode"] ? 2 : 4;
 		for (var ti = audioBuffers.length - 1; ti >= 0; ti--) {
 			var b = audioBuffers[ti];
 			if (b && !b.is_music) {
@@ -641,12 +698,19 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (!inUse || forceAll) {
 					b.release();
 					audioBuffers.splice(ti, 1);
-					if (!forceAll && audioBuffers.length <= 10) break;
+					if (!forceAll && audioBuffers.length <= keepLimit) break;
 				}
 			}
 		}
 	};
-	window.__c2PurgeMemory = function () {
+	window.__c2PurgeMemory = function (aggressive) {
+		if (aggressive) {
+			window["__z3LowRamMode"] = true;
+			try { localStorage.setItem("Z3_LOW_RAM_MODE", "1"); } catch (e) {}
+		}
+		if (window.__c2ClearTexQueue) {
+			window.__c2ClearTexQueue();
+		}
 		var rt = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
 		if (rt && rt.glwrap && rt.glwrap.evictUnusedTextures) {
 			rt.glwrap.evictUnusedTextures(true);
@@ -654,8 +718,14 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (window.__c2TrimAudioBuffers) {
 			window.__c2TrimAudioBuffers(true);
 		}
-		if (window.__c2ClearTexQueue) {
-			window.__c2ClearTexQueue();
+		if (rt && rt.gl) {
+			try { rt.gl.flush(); rt.gl.finish(); } catch (e) {}
+		}
+		if (aggressive && rt && rt["setSize"]) {
+			try {
+				rt.devicePixelRatio = 1.0;
+				rt["setSize"](window.innerWidth, window.innerHeight, true);
+			} catch (e) {}
 		}
 	};
 	instanceProto.getAudioBuffer = function (src_, is_music, dont_create)
@@ -668,7 +738,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			if (playMusicAsSoundWorkaround && is_music)
 				this.releaseAllMusicBuffers();
-			if (!is_music && audioBuffers.length >= 16 && window.__c2TrimAudioBuffers)
+			var _maxAudio = window["__z3LowRamMode"] ? 4 : 8;
+			if (!is_music && audioBuffers.length >= _maxAudio && window.__c2TrimAudioBuffers)
 				window.__c2TrimAudioBuffers(false);
 			ret = new C2AudioBuffer(src_, is_music);
 			audioBuffers.push(ret);
@@ -829,10 +900,39 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     </style>
     <script>
     (function () {
-        // Throttled on-demand GPU texture loader queue (concurrency 2, createImageBitmap zero-RAM retention)
+        // Restore Low-RAM Anti-Reload Shield state BEFORE c2runtime initializes
+        try {
+            window.__z3LowRamMode = (localStorage.getItem("Z3_LOW_RAM_MODE") === "1");
+        } catch (e) {
+            window.__z3LowRamMode = false;
+        }
+        window.__z3SetLowRamMode = function (enabled) {
+            window.__z3LowRamMode = !!enabled;
+            try { localStorage.setItem("Z3_LOW_RAM_MODE", enabled ? "1" : "0"); } catch (e) {}
+            if (window.__c2ClearTexQueue) window.__c2ClearTexQueue();
+            var rt = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
+            if (rt) {
+                if (rt.glwrap && rt.glwrap.evictUnusedTextures) {
+                    rt.glwrap.evictUnusedTextures(true);
+                }
+                if (window.__c2TrimAudioBuffers) {
+                    window.__c2TrimAudioBuffers(true);
+                }
+                try {
+                    var targetDpr = enabled ? 1.0 : Math.min(1.5, window.devicePixelRatio || 1);
+                    if (rt.isRetina) rt.devicePixelRatio = targetDpr;
+                    if (rt["setSize"]) rt["setSize"](window.innerWidth, window.innerHeight, true);
+                } catch (e) {}
+                if (rt.gl) {
+                    try { rt.gl.flush(); rt.gl.finish(); } catch (e) {}
+                }
+            }
+        };
+
+        // Throttled on-demand GPU texture loader queue (concurrency 1 = halves peak PNG decode RAM spike!)
         var texQueue = [];
         var activeTexLoads = 0;
-        var MAX_TEX_CONCURRENCY = 2;
+        var MAX_TEX_CONCURRENCY = 1;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
                 activeTexLoads++;

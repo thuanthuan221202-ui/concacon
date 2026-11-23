@@ -727,6 +727,7 @@
             if (window.cr_setSuspended) window.cr_setSuspended(true);
             updateHeaderBalances();
             updateWheelUI();
+            updateCleanButtonUI();
             updateTriggerButtonVisibility();
 
             var canvas = document.getElementById("z3-wheel-canvas");
@@ -764,7 +765,34 @@
         }
     }
 
-    // Master Memory, WebGL, Audio & Cache Cleanup
+    function updateCleanButtonUI() {
+        var isLowRam = !!window.__z3LowRamMode;
+        var cleanBtn = document.getElementById("z3-clean-btn");
+        if (cleanBtn && !cleanBtn.classList.contains("cleaning")) {
+            if (isLowRam) {
+                cleanBtn.classList.add("shield-active");
+                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🛡️</span> DỌN RÁC";
+            } else {
+                cleanBtn.classList.remove("shield-active");
+                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
+            }
+        }
+        var toggleBtn = document.getElementById("z3-btn-toggle-lowram");
+        var statusTxt = document.getElementById("z3-lowram-status");
+        if (statusTxt) {
+            statusTxt.textContent = isLowRam
+                ? "ĐANG BẬT (-75% VRAM, 24MB Cap, DPR 1.0x)"
+                : "ĐANG TẮT (Đồ họa HD 1.5x, 44MB Cap)";
+            statusTxt.style.color = isLowRam ? "#00f5d4" : "#ffbe0b";
+        }
+        if (toggleBtn) {
+            toggleBtn.textContent = isLowRam
+                ? "🔄 Tắt Siêu Nhẹ (Quay về Đồ họa HD)"
+                : "🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)";
+        }
+    }
+
+    // Master Memory, WebGL, Audio & Cache Cleanup + Anti-Reload Low-RAM Shield
     async function performGarbageAndCacheClean() {
         var cleanBtn = document.getElementById("z3-clean-btn");
         if (cleanBtn) {
@@ -772,77 +800,61 @@
             cleanBtn.innerHTML = "<span class=\"z3-spin\">⚡</span> ĐANG DỌN...";
         }
 
-        // 1. Construct 2 master memory purge
+        var wasLowRam = !!window.__z3LowRamMode;
+        var rt = getC2Runtime();
+        var freedMB = 0;
+        try {
+            if (rt && rt.glwrap && rt.glwrap.getEstimatedVRAM) {
+                freedMB = Math.round(rt.glwrap.getEstimatedVRAM() / 1048576);
+            }
+        } catch (e) {}
+
+        // 1. Engage Low-RAM Anti-Reload Shield (-75% VRAM for 2048px sheets, 24MB cap, DPR 1.0x, 4 audio cap)
+        try {
+            if (window.__z3SetLowRamMode) {
+                window.__z3SetLowRamMode(true);
+            } else {
+                window.__z3LowRamMode = true;
+                try { localStorage.setItem("Z3_LOW_RAM_MODE", "1"); } catch (e) {}
+            }
+        } catch (e) {
+            console.warn("setLowRamMode:", e);
+        }
+
+        // 2. Construct 2 Master Memory Purge (clears texQueue, evicts 100% WebGL VRAM, trims AudioBuffers, flushes GPU)
         try {
             if (window.__c2PurgeMemory) {
-                window.__c2PurgeMemory();
+                window.__c2PurgeMemory(true);
             }
         } catch (e) {
             console.warn("c2PurgeMemory:", e);
         }
 
-        // 2. WebGL Texture & Pipeline Flush
-        var rt = getC2Runtime();
-        if (rt) {
-            try {
-                if (rt.glwrap) {
-                    if (rt.glwrap.evictUnusedTextures) {
-                        rt.glwrap.evictUnusedTextures(true);
-                    }
-                    if (rt.gl) {
-                        rt.gl.flush();
-                        rt.gl.finish();
-                    }
-                }
-            } catch (e) {
-                console.warn("WebGL purge:", e);
-            }
-
-            // 3. Purge all inactive battle sprites from memory while in Menu
-            try {
-                if (rt.all_object_types && rt.running_layout && rt.running_layout.name === "Menu Inicial") {
-                    for (var i = 0; i < rt.all_object_types.length; i++) {
-                        var objType = rt.all_object_types[i];
-                        if (objType && objType.animations) {
-                            var oName = (objType.name || "").toLowerCase();
-                            if (oName.indexOf("menu") !== -1 || oName.indexOf("cursor") !== -1 || oName.indexOf("logo") !== -1 || oName === "t240") {
-                                continue;
-                            }
-                            for (var a = 0; a < objType.animations.length; a++) {
-                                var anim = objType.animations[a];
-                                if (anim && anim.frames) {
-                                    for (var f = 0; f < anim.frames.length; f++) {
-                                        var frame = anim.frames[f];
-                                        if (frame) {
-                                            if (frame.webGL_texture && rt.gl) {
-                                                try { rt.gl.deleteTexture(frame.webGL_texture); } catch (e) {}
-                                                frame.webGL_texture = null;
-                                            }
-                                            if (frame.unload_texture) {
-                                                try { frame.unload_texture(); } catch (e) {}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            } catch (e) {
-                console.warn("Battle frame purge:", e);
-            }
-        }
-
-        // 4. Construct 2 Web Audio Buffers release
+        // 3. Reset any leftover non-menu AudioContext idle state & release offscreen temp canvases
         try {
-            if (window.__c2TrimAudioBuffers) {
-                window.__c2TrimAudioBuffers(true);
+            if (window.__z3ResizeCanvas) {
+                window.__z3ResizeCanvas.width = 1;
+                window.__z3ResizeCanvas.height = 1;
+            }
+            if (rt && rt.glwrap && rt.glwrap.evictUnusedTextures) {
+                rt.glwrap.evictUnusedTextures(true);
+            }
+            if (rt && rt.gl) {
+                rt.gl.flush();
+                rt.gl.finish();
             }
         } catch (e) {
-            console.warn("Audio buffer purge:", e);
+            console.warn("WebGL flush:", e);
         }
 
-        // 5. CacheStorage release (clean WebKit caches)
+        // 4. Native iOS WKWebView Cache Cleanup (URLCache + Memory/Disk/Fetch cache; preserves localStorage/IndexedDB)
+        try {
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3NativeClean) {
+                window.webkit.messageHandlers.z3NativeClean.postMessage("clean");
+            }
+        } catch (e) {}
+
+        // 5. Web CacheStorage cleanup
         try {
             if (window.caches && caches.keys) {
                 var keys = await caches.keys();
@@ -850,11 +862,9 @@
                     await caches.delete(keys[ci]);
                 }
             }
-        } catch (e) {
-            console.warn("CacheStorage delete:", e);
-        }
+        } catch (e) {}
 
-        // 6. Clear Performance Timings & SessionStorage (preserve localStorage save data!)
+        // 6. Clear Performance Timings & SessionStorage (NEVER touch localStorage save data!)
         try {
             if (window.performance) {
                 if (performance.clearResourceTimings) performance.clearResourceTimings();
@@ -864,19 +874,12 @@
             if (window.sessionStorage) {
                 sessionStorage.clear();
             }
-        } catch (e) {}
-
-        // 7. Force JavaScriptCore / WebKit generational & full GC
-        try {
-            if (window.gc) window.gc();
-            for (var gci = 0; gci < 4; gci++) {
-                var _tmp = new ArrayBuffer(1024 * 1024 * 8); // 8MB transient
-                var _u = new Uint8Array(_tmp);
-                _u[0] = 1;
+            if (window.gc) {
+                window.gc();
             }
         } catch (e) {}
 
-        // 8. Chime sound feedback
+        // 7. Chime sound feedback
         try {
             playSynthTone(587.33, 0.08, "triangle");
             setTimeout(function () {
@@ -884,14 +887,19 @@
             }, 80);
         } catch (e) {}
 
-        // 9. Feedback toast & reset button state
+        // 8. Feedback toast & update button to Shield state
         setTimeout(function () {
             if (cleanBtn) {
                 cleanBtn.classList.remove("cleaning");
-                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
             }
-            showToast("✨ Đã dọn sạch RAM & Cache! Game đã được giải phóng bộ nhớ tối đa.");
-        }, 450);
+            updateCleanButtonUI();
+            var freedNote = freedMB > 0 ? (" (Giải phóng ~" + freedMB + "MB VRAM)") : "";
+            if (!wasLowRam) {
+                showToast("🛡️ Đã dọn RAM & Bật Chế Độ Siêu Nhẹ -75% VRAM" + freedNote + "! Vào trận không lo reload.");
+            } else {
+                showToast("🛡️ Đã dọn sạch RAM & Cache" + freedNote + "! Khiên Chống Reload đang bảo vệ.");
+            }
+        }, 400);
     }
 
     // Build DOM
@@ -902,7 +910,7 @@
         var dock = document.createElement("div");
         dock.id = "z3-dock-bar";
 
-        // Clean Cache & Garbage Button
+        // Clean Cache & Anti-Reload Shield Button
         var cleanBtn = document.createElement("button");
         cleanBtn.id = "z3-clean-btn";
         cleanBtn.className = "z3-dock-btn";
@@ -976,6 +984,11 @@
                                 "<div class=\"z3-card-desc\">Dán mã sao lưu (bắt đầu bằng Z3SAVE_...) vào ô dưới đây khi bạn xóa game cài lại để lấy lại toàn bộ quá trình chơi!</div>" +
                                 "<textarea class=\"z3-textarea\" id=\"z3-import-textarea\" placeholder=\"Dán mã sao lưu Z3SAVE_... vào đây\"></textarea>" +
                                 "<button class=\"z3-btn z3-btn-import\" id=\"z3-btn-do-import\">🔄 KHÔI PHỤC NGAY</button>" +
+                            "</div>" +
+                            "<div class=\"z3-card\" style=\"grid-column: 1 / -1;\">" +
+                                "<div class=\"z3-card-title\"><span>🛡️</span> Chế Độ Siêu Nhẹ (Chống Reload iOS)</div>" +
+                                "<div class=\"z3-card-desc\">Trạng thái: <b id=\"z3-lowram-status\">ĐANG TẮT</b>. Giảm 75% dung lượng ảnh sprite khổng lồ (2048px → 1024px) & giới hạn VRAM 24MB giúp vào trận mượt ngay cả khi điện thoại đã dùng lâu trong ngày mà không cần khởi động lại máy.</div>" +
+                                "<button class=\"z3-btn z3-btn-import\" id=\"z3-btn-toggle-lowram\">🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)</button>" +
                             "</div>" +
                         "</div>" +
                     "</div>" +
@@ -1080,6 +1093,21 @@
         addTapListener(document.getElementById("z3-btn-do-export"), exportSaveData);
         addTapListener(document.getElementById("z3-btn-do-import"), importSaveData);
         addTapListener(document.getElementById("z3-btn-redeem"), redeemGiftcode);
+        addTapListener(document.getElementById("z3-btn-toggle-lowram"), function () {
+            var nextState = !window.__z3LowRamMode;
+            if (window.__z3SetLowRamMode) {
+                window.__z3SetLowRamMode(nextState);
+            } else {
+                window.__z3LowRamMode = nextState;
+                try { localStorage.setItem("Z3_LOW_RAM_MODE", nextState ? "1" : "0"); } catch (e) {}
+            }
+            updateCleanButtonUI();
+            if (nextState) {
+                showToast("🛡️ Đã BẬT Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)!");
+            } else {
+                showToast("✨ Đã chuyển về Đồ họa HD (44MB VRAM, DPR 1.5x)!");
+            }
+        });
 
         // Stop all pointer/touch/mouse events bubbling UP through overlay to document/canvas
         // (Uses bubble phase { capture: false }, so children inside overlay receive their clicks freely)
@@ -1120,6 +1148,7 @@
             });
         }
 
+        updateCleanButtonUI();
         updateTriggerButtonVisibility();
     }
 

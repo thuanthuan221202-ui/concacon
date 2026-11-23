@@ -1,7 +1,7 @@
 import UIKit
 import WebKit
 
-final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
+final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private var webView: WKWebView!
 
     override var prefersStatusBarHidden: Bool { true }
@@ -22,6 +22,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         config.defaultWebpagePreferences.preferredContentMode = .mobile
         config.websiteDataStore = .default()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
+        config.userContentController.add(self, name: "z3NativeClean")
 
         if let wwwURL = Bundle.main.url(forResource: "www", withExtension: nil) {
             let handler = WebSchemeHandler(wwwRoot: wwwURL)
@@ -100,7 +101,22 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
         NSLog("[ZLegends3] OS Memory Warning received! Purging game textures and audio...")
-        webView?.evaluateJavaScript("if (window.__c2PurgeMemory) window.__c2PurgeMemory();", completionHandler: nil)
+        URLCache.shared.removeAllCachedResponses()
+        webView?.evaluateJavaScript("if (window.__c2PurgeMemory) window.__c2PurgeMemory(true);", completionHandler: nil)
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "z3NativeClean" else { return }
+        NSLog("[ZLegends3] Native cache cleanup triggered from JS.")
+        URLCache.shared.removeAllCachedResponses()
+        let cacheTypes: Set<String> = [
+            WKWebsiteDataTypeMemoryCache,
+            WKWebsiteDataTypeDiskCache,
+            WKWebsiteDataTypeFetchCache
+        ]
+        WKWebsiteDataStore.default().removeData(ofTypes: cacheTypes, modifiedSince: .distantPast) {
+            NSLog("[ZLegends3] WebKit Memory/Disk/Fetch caches cleared cleanly (save data preserved).")
+        }
     }
 
     func webView(
