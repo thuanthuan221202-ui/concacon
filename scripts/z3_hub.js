@@ -727,7 +727,6 @@
             if (window.cr_setSuspended) window.cr_setSuspended(true);
             updateHeaderBalances();
             updateWheelUI();
-            updateCleanButtonUI();
             updateTriggerButtonVisibility();
 
             var canvas = document.getElementById("z3-wheel-canvas");
@@ -762,33 +761,6 @@
                 var ctx = canvas.getContext("2d");
                 renderWheel(ctx, canvas.width, currentRotation);
             }
-        }
-    }
-
-    function updateCleanButtonUI() {
-        var isLowRam = !!window.__z3LowRamMode;
-        var cleanBtn = document.getElementById("z3-clean-btn");
-        if (cleanBtn && !cleanBtn.classList.contains("cleaning")) {
-            if (isLowRam) {
-                cleanBtn.classList.add("shield-active");
-                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🛡️</span> DỌN RÁC";
-            } else {
-                cleanBtn.classList.remove("shield-active");
-                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
-            }
-        }
-        var toggleBtn = document.getElementById("z3-btn-toggle-lowram");
-        var statusTxt = document.getElementById("z3-lowram-status");
-        if (statusTxt) {
-            statusTxt.textContent = isLowRam
-                ? "ĐANG BẬT (-75% VRAM, 24MB Cap, DPR 1.0x)"
-                : "ĐANG TẮT (Đồ họa gốc 100%, 40MB VRAM Cap)";
-            statusTxt.style.color = isLowRam ? "#00f5d4" : "#ffbe0b";
-        }
-        if (toggleBtn) {
-            toggleBtn.textContent = isLowRam
-                ? "🔄 Tắt Siêu Nhẹ (Quay về Đồ họa gốc 100%)"
-                : "🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM, tùy chọn)";
         }
     }
 
@@ -879,8 +851,8 @@
         setTimeout(function () {
             if (cleanBtn) {
                 cleanBtn.classList.remove("cleaning");
+                cleanBtn.innerHTML = "<span class=\"z3-clean-icon\">🧹</span> DỌN RÁC";
             }
-            updateCleanButtonUI();
             var freedNote = freedMB > 0 ? (" (Giải phóng ~" + freedMB + "MB VRAM)") : "";
             showToast("✨ Đã dọn sạch RAM, VRAM & Cache" + freedNote + "! Giữ nguyên 100% độ nét gốc.");
         }, 400);
@@ -968,11 +940,6 @@
                                 "<div class=\"z3-card-desc\">Dán mã sao lưu (bắt đầu bằng Z3SAVE_...) vào ô dưới đây khi bạn xóa game cài lại để lấy lại toàn bộ quá trình chơi!</div>" +
                                 "<textarea class=\"z3-textarea\" id=\"z3-import-textarea\" placeholder=\"Dán mã sao lưu Z3SAVE_... vào đây\"></textarea>" +
                                 "<button class=\"z3-btn z3-btn-import\" id=\"z3-btn-do-import\">🔄 KHÔI PHỤC NGAY</button>" +
-                            "</div>" +
-                            "<div class=\"z3-card\" style=\"grid-column: 1 / -1;\">" +
-                                "<div class=\"z3-card-title\"><span>🛡️</span> Chế Độ Siêu Nhẹ (Chống Reload iOS)</div>" +
-                                "<div class=\"z3-card-desc\">Trạng thái: <b id=\"z3-lowram-status\">ĐANG TẮT</b>. Giảm 75% dung lượng ảnh sprite khổng lồ (2048px → 1024px) & giới hạn VRAM 24MB giúp vào trận mượt ngay cả khi điện thoại đã dùng lâu trong ngày mà không cần khởi động lại máy.</div>" +
-                                "<button class=\"z3-btn z3-btn-import\" id=\"z3-btn-toggle-lowram\">🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)</button>" +
                             "</div>" +
                         "</div>" +
                     "</div>" +
@@ -1077,21 +1044,6 @@
         addTapListener(document.getElementById("z3-btn-do-export"), exportSaveData);
         addTapListener(document.getElementById("z3-btn-do-import"), importSaveData);
         addTapListener(document.getElementById("z3-btn-redeem"), redeemGiftcode);
-        addTapListener(document.getElementById("z3-btn-toggle-lowram"), function () {
-            var nextState = !window.__z3LowRamMode;
-            if (window.__z3SetLowRamMode) {
-                window.__z3SetLowRamMode(nextState);
-            } else {
-                window.__z3LowRamMode = nextState;
-                try { localStorage.setItem("Z3_LOW_RAM_MODE", nextState ? "1" : "0"); } catch (e) {}
-            }
-            updateCleanButtonUI();
-            if (nextState) {
-                showToast("🛡️ Đã BẬT Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)!");
-            } else {
-                showToast("✨ Đã chuyển về Đồ họa gốc 100% sắc nét (40MB VRAM)!");
-            }
-        });
 
         // Stop all pointer/touch/mouse events bubbling UP through overlay to document/canvas
         // (Uses bubble phase { capture: false }, so children inside overlay receive their clicks freely)
@@ -1132,7 +1084,6 @@
             });
         }
 
-        updateCleanButtonUI();
         updateTriggerButtonVisibility();
     }
 
