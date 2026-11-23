@@ -299,12 +299,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
   }
 
-  // 6. Cap DevicePixelRatio (1.5 normal, 1.0 in Low-RAM Shield mode) to prevent Retina framebuffer VRAM explosion
-  if (!rt.includes('__z3LowRamMode ? 1.0 : 1.5')) {
+  // 6. Cap DevicePixelRatio to 2.0 (100% original sharp Retina quality; 1.0 only if manual Low-RAM mode enabled)
+  if (!rt.includes('__z3LowRamMode"] ? 1.0 : 2.0')) {
     const beforeDpr = rt;
     rt = rt.replace(
       'this.devicePixelRatio = (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1);',
-      'this.devicePixelRatio = Math.min((window["__z3LowRamMode"] ? 1.0 : 1.5), (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
+      'this.devicePixelRatio = Math.min((window["__z3LowRamMode"] ? 1.0 : 2.0), (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
     );
     if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
   }
@@ -557,7 +557,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	GLWrap_.prototype.evictUnusedTextures = function (forceAll, incomingBytes)
 	{
 		var now = Date.now();
-		var VRAM_BUDGET = (window["__z3LowRamMode"] ? 24 : 44) * 1024 * 1024;
+		var VRAM_BUDGET = (window["__z3LowRamMode"] ? 24 : 40) * 1024 * 1024;
 		var UNUSED_THRESHOLD = incomingBytes ? 250 : 2000;
 		var totalVRAM = incomingBytes || 0;
 		var loadedList = [];
@@ -703,11 +703,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 		}
 	};
-	window.__c2PurgeMemory = function (aggressive) {
-		if (aggressive) {
-			window["__z3LowRamMode"] = true;
-			try { localStorage.setItem("Z3_LOW_RAM_MODE", "1"); } catch (e) {}
-		}
+	window.__c2PurgeMemory = function () {
 		if (window.__c2ClearTexQueue) {
 			window.__c2ClearTexQueue();
 		}
@@ -720,12 +716,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		}
 		if (rt && rt.gl) {
 			try { rt.gl.flush(); rt.gl.finish(); } catch (e) {}
-		}
-		if (aggressive && rt && rt["setSize"]) {
-			try {
-				rt.devicePixelRatio = 1.0;
-				rt["setSize"](window.innerWidth, window.innerHeight, true);
-			} catch (e) {}
 		}
 	};
 	instanceProto.getAudioBuffer = function (src_, is_music, dont_create)
@@ -919,7 +909,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
                     window.__c2TrimAudioBuffers(true);
                 }
                 try {
-                    var targetDpr = enabled ? 1.0 : Math.min(1.5, window.devicePixelRatio || 1);
+                    var targetDpr = enabled ? 1.0 : Math.min(2.0, window.devicePixelRatio || 1);
                     if (rt.isRetina) rt.devicePixelRatio = targetDpr;
                     if (rt["setSize"]) rt["setSize"](window.innerWidth, window.innerHeight, true);
                 } catch (e) {}

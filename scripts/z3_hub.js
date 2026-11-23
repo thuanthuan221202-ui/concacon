@@ -782,17 +782,17 @@
         if (statusTxt) {
             statusTxt.textContent = isLowRam
                 ? "ĐANG BẬT (-75% VRAM, 24MB Cap, DPR 1.0x)"
-                : "ĐANG TẮT (Đồ họa HD 1.5x, 44MB Cap)";
+                : "ĐANG TẮT (Đồ họa gốc 100%, 40MB VRAM Cap)";
             statusTxt.style.color = isLowRam ? "#00f5d4" : "#ffbe0b";
         }
         if (toggleBtn) {
             toggleBtn.textContent = isLowRam
-                ? "🔄 Tắt Siêu Nhẹ (Quay về Đồ họa HD)"
-                : "🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)";
+                ? "🔄 Tắt Siêu Nhẹ (Quay về Đồ họa gốc 100%)"
+                : "🛡️ Bật Chế Độ Siêu Nhẹ (-75% VRAM, tùy chọn)";
         }
     }
 
-    // Master Memory, WebGL, Audio & Cache Cleanup + Anti-Reload Low-RAM Shield
+    // Master Memory, WebGL, Audio & Cache Cleanup (100% preserves original graphics sharpness!)
     async function performGarbageAndCacheClean() {
         var cleanBtn = document.getElementById("z3-clean-btn");
         if (cleanBtn) {
@@ -800,7 +800,6 @@
             cleanBtn.innerHTML = "<span class=\"z3-spin\">⚡</span> ĐANG DỌN...";
         }
 
-        var wasLowRam = !!window.__z3LowRamMode;
         var rt = getC2Runtime();
         var freedMB = 0;
         try {
@@ -809,28 +808,17 @@
             }
         } catch (e) {}
 
-        // 1. Engage Low-RAM Anti-Reload Shield (-75% VRAM for 2048px sheets, 24MB cap, DPR 1.0x, 4 audio cap)
-        try {
-            if (window.__z3SetLowRamMode) {
-                window.__z3SetLowRamMode(true);
-            } else {
-                window.__z3LowRamMode = true;
-                try { localStorage.setItem("Z3_LOW_RAM_MODE", "1"); } catch (e) {}
-            }
-        } catch (e) {
-            console.warn("setLowRamMode:", e);
-        }
-
-        // 2. Construct 2 Master Memory Purge (clears texQueue, evicts 100% WebGL VRAM, trims AudioBuffers, flushes GPU)
+        // 1. Construct 2 Master Memory Purge (clears texQueue, evicts 100% WebGL VRAM, trims AudioBuffers, flushes GPU)
+        // Does NOT lower resolution or DPR — keeps 100% original graphics sharpness!
         try {
             if (window.__c2PurgeMemory) {
-                window.__c2PurgeMemory(true);
+                window.__c2PurgeMemory();
             }
         } catch (e) {
             console.warn("c2PurgeMemory:", e);
         }
 
-        // 3. Reset any leftover non-menu AudioContext idle state & release offscreen temp canvases
+        // 2. Release offscreen temp canvases & double-flush WebGL pipeline
         try {
             if (window.__z3ResizeCanvas) {
                 window.__z3ResizeCanvas.width = 1;
@@ -847,14 +835,14 @@
             console.warn("WebGL flush:", e);
         }
 
-        // 4. Native iOS WKWebView Cache Cleanup (URLCache + Memory/Disk/Fetch cache; preserves localStorage/IndexedDB)
+        // 3. Native iOS WKWebView Cache Cleanup (URLCache + Memory/Disk/Fetch cache; preserves localStorage/IndexedDB)
         try {
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3NativeClean) {
                 window.webkit.messageHandlers.z3NativeClean.postMessage("clean");
             }
         } catch (e) {}
 
-        // 5. Web CacheStorage cleanup
+        // 4. Web CacheStorage cleanup
         try {
             if (window.caches && caches.keys) {
                 var keys = await caches.keys();
@@ -864,7 +852,7 @@
             }
         } catch (e) {}
 
-        // 6. Clear Performance Timings & SessionStorage (NEVER touch localStorage save data!)
+        // 5. Clear Performance Timings & SessionStorage (NEVER touch localStorage save data!)
         try {
             if (window.performance) {
                 if (performance.clearResourceTimings) performance.clearResourceTimings();
@@ -879,7 +867,7 @@
             }
         } catch (e) {}
 
-        // 7. Chime sound feedback
+        // 6. Chime sound feedback
         try {
             playSynthTone(587.33, 0.08, "triangle");
             setTimeout(function () {
@@ -887,18 +875,14 @@
             }, 80);
         } catch (e) {}
 
-        // 8. Feedback toast & update button to Shield state
+        // 7. Feedback toast & restore button state
         setTimeout(function () {
             if (cleanBtn) {
                 cleanBtn.classList.remove("cleaning");
             }
             updateCleanButtonUI();
             var freedNote = freedMB > 0 ? (" (Giải phóng ~" + freedMB + "MB VRAM)") : "";
-            if (!wasLowRam) {
-                showToast("🛡️ Đã dọn RAM & Bật Chế Độ Siêu Nhẹ -75% VRAM" + freedNote + "! Vào trận không lo reload.");
-            } else {
-                showToast("🛡️ Đã dọn sạch RAM & Cache" + freedNote + "! Khiên Chống Reload đang bảo vệ.");
-            }
+            showToast("✨ Đã dọn sạch RAM, VRAM & Cache" + freedNote + "! Giữ nguyên 100% độ nét gốc.");
         }, 400);
     }
 
@@ -1105,7 +1089,7 @@
             if (nextState) {
                 showToast("🛡️ Đã BẬT Chế Độ Siêu Nhẹ (-75% VRAM Chống Reload)!");
             } else {
-                showToast("✨ Đã chuyển về Đồ họa HD (44MB VRAM, DPR 1.5x)!");
+                showToast("✨ Đã chuyển về Đồ họa gốc 100% sắc nét (40MB VRAM)!");
             }
         });
 

@@ -102,7 +102,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         super.didReceiveMemoryWarning()
         NSLog("[ZLegends3] OS Memory Warning received! Purging game textures and audio...")
         URLCache.shared.removeAllCachedResponses()
-        webView?.evaluateJavaScript("if (window.__c2PurgeMemory) window.__c2PurgeMemory(true);", completionHandler: nil)
+        webView?.evaluateJavaScript("if (window.__c2PurgeMemory) window.__c2PurgeMemory();", completionHandler: nil)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
