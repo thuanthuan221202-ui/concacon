@@ -265,26 +265,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch playMusicAsSoundWorkaround');
   }
 
-  // 2b. Native Swift Audio Bridge: bypass WebContent AudioContext & PCM decode completely (saves 100-165MB WebContent RAM!)
+  // 2b. Hybrid Native Swift Audio Bridge:
+  //     - Music OST (42-85MB PCM) & long Dramatic Finish SFX (13-16MB PCM) -> Native Swift AVAudioPlayer (0MB in WebContent, 0 combat lag!)
+  //     - Rapid short combat SFX (punches/ki blasts) -> low-latency WebAudio with strict 6-buffer LRU cap (~3MB total, 0ms IPC lag!)
   if (!rt.includes('__z3NativeAudio')) {
-    const beforeNAInit = rt;
-    rt = rt.replace(
-      /context\s*=\s*null;\s*\r?\n\t\tif\s*\(typeof AudioContext !== "undefined"\)/,
-      `context = null;
-		var __useNativeAudio = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio);
-		if (!__useNativeAudio) {
-		if (typeof AudioContext !== "undefined")`
-    );
-    rt = rt.replace(
-      /else if \(typeof webkitAudioContext !== "undefined"\)\s*\r?\n\t\t\t\tcontext = new webkitAudioContext\(\);\s*\r?\n\t\t\}/,
-      `else if (typeof webkitAudioContext !== "undefined")
-				context = new webkitAudioContext();
-		}
-		}`
-    );
-    if (rt === beforeNAInit) throw new Error('Failed to patch Native AudioContext skip');
-
-    // Inject JS-side synchronous state tracker + bridge helpers right before Cnds() in Audio plugin
     const beforeNACnds = rt;
     rt = rt.replace(
       /Cnds\.prototype\.IsAnyPlaying\s*=\s*function\s*\(\)\s*\{/,
@@ -294,6 +278,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		lastId: 0,
 		hasBridge: function () {
 			return !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio);
+		},
+		shouldUseNative: function (src, isMusic) {
+			if (!this.hasBridge()) return false;
+			if (isMusic) return true;
+			var s = String(src || "").toLowerCase();
+			return s.indexOf("dramaticfinish") !== -1 || s.indexOf("theme") !== -1;
 		},
 		post: function (payload) {
 			try {
@@ -365,8 +355,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	};
 	Cnds.prototype.IsAnyPlaying = function ()
 	{
-		if (__z3NA.hasBridge())
-			return __z3NA.isAnyPlaying();`
+		if (__z3NA.hasBridge() && __z3NA.isAnyPlaying())
+			return true;`
     );
     if (rt === beforeNACnds) throw new Error('Failed to patch Native Audio IsAnyPlaying');
 
@@ -374,8 +364,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       /Cnds\.prototype\.IsTagPlaying\s*=\s*function\s*\(tag\)\s*\{/,
       `Cnds.prototype.IsTagPlaying = function (tag)
 	{
-		if (__z3NA.hasBridge())
-			return __z3NA.isTagPlaying(tag);`
+		if (__z3NA.hasBridge() && __z3NA.isTagPlaying(tag))
+			return true;`
     );
 
     rt = rt.replace(
@@ -387,7 +377,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		var v = dbToLinear(vol);
 		var is_music = file[1];
 		var src = this.runtime.files_subfolder + file[0] + (useOgg ? ".ogg" : ".m4a");
-		if (__z3NA.hasBridge()) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
+		if (__z3NA.shouldUseNative(src, is_music)) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
     );
 
     rt = rt.replace(
@@ -399,42 +389,42 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		var v = dbToLinear(vol);
 		var is_music = (folder === 1);
 		var src = this.runtime.files_subfolder + filename.toLowerCase() + (useOgg ? ".ogg" : ".m4a");
-		if (__z3NA.hasBridge()) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
+		if (__z3NA.shouldUseNative(src, is_music)) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
     );
 
     rt = rt.replace(
       /Acts\.prototype\.SetLooping\s*=\s*function\s*\(tag,\s*looping\)\s*\{/,
       `Acts.prototype.SetLooping = function (tag, looping)
 	{
-		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setLooping", tag: tag || "", looping: looping === 0 }); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setLooping", tag: tag || "", looping: looping === 0 }); }`
     );
 
     rt = rt.replace(
       /Acts\.prototype\.SetMuted\s*=\s*function\s*\(tag,\s*muted\)\s*\{/,
       `Acts.prototype.SetMuted = function (tag, muted)
 	{
-		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMuted", tag: tag || "", muted: muted === 0 }); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMuted", tag: tag || "", muted: muted === 0 }); }`
     );
 
     rt = rt.replace(
       /Acts\.prototype\.SetVolume\s*=\s*function\s*\(tag,\s*vol\)\s*\{/,
       `Acts.prototype.SetVolume = function (tag, vol)
 	{
-		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setVolume", tag: tag || "", volume: dbToLinear(vol) }); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setVolume", tag: tag || "", volume: dbToLinear(vol) }); }`
     );
 
     rt = rt.replace(
       /Acts\.prototype\.Stop\s*=\s*function\s*\(tag\)\s*\{/,
       `Acts.prototype.Stop = function (tag)
 	{
-		if (__z3NA.hasBridge()) { __z3NA.stop(tag); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.stop(tag); }`
     );
 
     rt = rt.replace(
       /Acts\.prototype\.StopAll\s*=\s*function\s*\(\)\s*\{/,
       `Acts.prototype.StopAll = function ()
 	{
-		if (__z3NA.hasBridge()) { __z3NA.stopAll(); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.stopAll(); }`
     );
 
     rt = rt.replace(
@@ -450,7 +440,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				}
 			}
 			__z3NA.post({ cmd: "setPaused", tag: tag || "", paused: p });
-			return;
 		}`
     );
 
@@ -458,7 +447,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       /Acts\.prototype\.Seek\s*=\s*function\s*\(tag,\s*pos\)\s*\{/,
       `Acts.prototype.Seek = function (tag, pos)
 	{
-		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "seek", tag: tag || "", pos: pos }); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "seek", tag: tag || "", pos: pos }); }`
     );
 
     rt = rt.replace(
@@ -469,9 +458,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (s === 2)
 			s = (silent ? 1 : 0);
 		if (__z3NA.hasBridge()) {
-			silent = (s === 0);
-			__z3NA.post({ cmd: "setSilent", silent: silent });
-			return;
+			__z3NA.post({ cmd: "setSilent", silent: (s === 0) });
 		}`
     );
 
@@ -480,7 +467,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       `Acts.prototype.SetMasterVolume = function (vol)
 	{
 		masterVolume = dbToLinear(vol);
-		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMasterVolume", volume: masterVolume }); return; }`
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMasterVolume", volume: masterVolume }); }`
     );
 
     rt = rt.replace(
@@ -498,7 +485,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			return;
 		if (window["__z3NativeAudio"] && window["__z3NativeAudio"].hasBridge()) {
 			window["__z3NativeAudio"].post({ cmd: "setSuspended", suspended: !!s });
-			return;
 		}`
     );
   }
@@ -817,7 +803,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	var blankPixel1x1 = new Uint8Array([0, 0, 0, 0]);
 	window["__c2MemPressure"] = 0;
 	window["__c2SetMemoryPressure"] = function (lvl) {
-		window["__c2MemPressure"] = (lvl === 2) ? 2 : ((lvl === 1) ? 1 : 0);
+		// Smooth clamp: never let background watchdog starve combat VRAM below Level 1
+		window["__c2MemPressure"] = (lvl >= 1) ? 1 : 0;
 	};
 	GLWrap_.prototype.getEstimatedVRAM = function ()
 	{
@@ -1066,7 +1053,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     rt = rt.replace(
       /instanceProto\.getAudioBuffer\s*=\s*function\s*\(src_,\s*is_music,\s*dont_create\)\s*\{\s*\r?\n\t\tvar\s*i,\s*len,\s*a,\s*ret\s*=\s*null,\s*j,\s*k,\s*lenj,\s*ai;/,
       `window.__c2TrimAudioBuffers = function (forceAll) {
-		var keepLimit = 2;
+		var keepLimit = 3;
 		for (var ti = audioBuffers.length - 1; ti >= 0; ti--) {
 			var b = audioBuffers[ti];
 			if (b && !b.is_music) {
@@ -1086,17 +1073,23 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 		}
 	};
-	window.__c2EmergencyPurge = function (level) {
+	var __z3LastAutoPurge = 0;
+	window.__c2EmergencyPurge = function (level, isExplicit) {
 		var lvl = (typeof level === "number") ? level : 2;
-		if (lvl >= 2 && window.__c2ClearTexQueue) {
+		// CRITICAL 60FPS GUARD: Never wipe active on-screen fighters during combat from periodic OS watchdog!
+		// Full wipe (forceAll + gl.finish) ONLY runs when backgrounded (document.hidden), switching layouts, or user taps Clean.
+		var allowFullWipe = (lvl >= 2) && (!!isExplicit || !!document.hidden);
+		if (!allowFullWipe) {
+			var _nowP = Date.now();
+			if (!isExplicit && (_nowP - __z3LastAutoPurge) < 8000) return;
+			__z3LastAutoPurge = _nowP;
+		}
+		if (allowFullWipe && window.__c2ClearTexQueue) {
 			window.__c2ClearTexQueue();
-		} else if (lvl === 1 && window.__c2TrimTexQueue) {
-			window.__c2TrimTexQueue();
 		}
 		var rt = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
 		if (rt) {
-			// Clear recycled deadCache pools to release stale JS instances
-			if (rt.types_by_index) {
+			if (allowFullWipe && rt.types_by_index) {
 				for (var di = 0; di < rt.types_by_index.length; di++) {
 					var dt = rt.types_by_index[di];
 					if (dt && dt.deadCache && dt.deadCache.length > 0) {
@@ -1105,7 +1098,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				}
 			}
 			if (rt.glwrap && rt.glwrap.evictUnusedTextures) {
-				if (lvl >= 2) {
+				if (allowFullWipe) {
 					rt.glwrap.evictUnusedTextures(true);
 				} else {
 					rt.glwrap.evictUnusedTextures(false, 16 * 1024 * 1024);
@@ -1113,14 +1106,14 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 		}
 		if (window.__c2TrimAudioBuffers) {
-			window.__c2TrimAudioBuffers(lvl >= 2);
+			window.__c2TrimAudioBuffers(allowFullWipe);
 		}
-		if (window["__z3NativeAudio"] && window["__z3NativeAudio"].hasBridge()) {
+		if (allowFullWipe && window["__z3NativeAudio"] && window["__z3NativeAudio"].hasBridge()) {
 			window["__z3NativeAudio"].post({ cmd: "purgeCache" });
 		}
 		if (rt && rt.gl) {
 			try {
-				if (lvl >= 2) { rt.gl.finish(); } else { rt.gl.flush(); }
+				if (allowFullWipe) { rt.gl.finish(); } else { rt.gl.flush(); }
 			} catch (e) {}
 		}
 		try {
@@ -1128,7 +1121,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		} catch (e) {}
 	};
 	window.__c2PurgeMemory = function () {
-		window.__c2EmergencyPurge(2);
+		window.__c2EmergencyPurge(2, true);
 	};
 	instanceProto.getAudioBuffer = function (src_, is_music, dont_create)
 	{
@@ -1140,7 +1133,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			if (playMusicAsSoundWorkaround && is_music)
 				this.releaseAllMusicBuffers();
-			if (!is_music && audioBuffers.length >= 4 && window.__c2TrimAudioBuffers)
+			if (!is_music && audioBuffers.length >= 6 && window.__c2TrimAudioBuffers)
 				window.__c2TrimAudioBuffers(false);
 			ret = new C2AudioBuffer(src_, is_music);
 			audioBuffers.push(ret);
@@ -1153,7 +1146,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     rt = rt.replace(
       /this\.running_layout\.stopRunning\(\);/,
       `this.running_layout.stopRunning();
-		if (window["__c2EmergencyPurge"]) window["__c2EmergencyPurge"](2);
+		if (window["__c2EmergencyPurge"]) window["__c2EmergencyPurge"](2, true);
 		try {
 			if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3NativeClean) {
 				window.webkit.messageHandlers.z3NativeClean.postMessage("layout_switch");

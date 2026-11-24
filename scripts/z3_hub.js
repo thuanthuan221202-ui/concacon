@@ -778,7 +778,7 @@
         // Does NOT lower resolution or DPR — keeps 100% original graphics sharpness & NEVER reloads!
         try {
             if (window.__c2EmergencyPurge) {
-                window.__c2EmergencyPurge(2);
+                window.__c2EmergencyPurge(2, true);
             } else if (window.__c2PurgeMemory) {
                 window.__c2PurgeMemory();
             }
