@@ -15,14 +15,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-ipa:
-    runs-on: macos-15
+    runs-on: macos-latest
     timeout-minutes: 45
 
     steps:
       - name: Checkout ma nguon du an
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Tim hoac tai file APK nguon
         env:
@@ -113,7 +117,7 @@ jobs:
           ls -lh Z_Legends_3.ipa
 
       - name: Tai file Z_Legends_3.ipa len Artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: Z_Legends_3_iOS_IPA
           path: dist/Z_Legends_3.ipa

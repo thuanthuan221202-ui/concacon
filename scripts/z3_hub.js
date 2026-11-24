@@ -668,13 +668,7 @@
         }
 
         await updateHeaderBalances();
-        showToast("🎉 Khôi phục thành công " + count + " mục dữ liệu!");
-
-        setTimeout(function () {
-            if (confirm("Khôi phục thành công! Bạn có muốn khởi động lại màn hình để áp dụng toàn bộ giao diện?")) {
-                window.location.reload();
-            }
-        }, 500);
+        showToast("🎉 Khôi phục thành công " + count + " mục dữ liệu! Đã áp dụng ngay (không reload).");
     }
 
     // Giftcodes System
@@ -780,14 +774,16 @@
             }
         } catch (e) {}
 
-        // 1. Construct 2 Master Memory Purge (clears texQueue, evicts 100% WebGL VRAM, trims AudioBuffers, flushes GPU)
-        // Does NOT lower resolution or DPR — keeps 100% original graphics sharpness!
+        // 1. Construct 2 Master Emergency Purge (clears texQueue, evicts 100% WebGL VRAM, trims Audio & deadCache, gl.finish)
+        // Does NOT lower resolution or DPR — keeps 100% original graphics sharpness & NEVER reloads!
         try {
-            if (window.__c2PurgeMemory) {
+            if (window.__c2EmergencyPurge) {
+                window.__c2EmergencyPurge(2);
+            } else if (window.__c2PurgeMemory) {
                 window.__c2PurgeMemory();
             }
         } catch (e) {
-            console.warn("c2PurgeMemory:", e);
+            console.warn("c2EmergencyPurge:", e);
         }
 
         // 2. Release offscreen temp canvases & double-flush WebGL pipeline
@@ -841,10 +837,10 @@
 
         // 6. Chime sound feedback
         try {
-            playSynthTone(587.33, 0.08, "triangle");
+            playTickSound();
             setTimeout(function () {
-                playSynthTone(880.00, 0.15, "triangle");
-            }, 80);
+                playTickSound();
+            }, 85);
         } catch (e) {}
 
         // 7. Feedback toast & restore button state

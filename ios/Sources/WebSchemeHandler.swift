@@ -29,80 +29,86 @@ final class WebSchemeHandler: NSObject, WKURLSchemeHandler {
         let root = self.wwwRoot
 
         ioQueue.async { [weak self] in
-            var relPath = requestURL.path
-            while relPath.hasPrefix("/") {
-                relPath.removeFirst()
-            }
-            if relPath.isEmpty {
-                relPath = "index.html"
-            }
-
-            let fileURL = root.appendingPathComponent(relPath).resolvingSymlinksInPath().standardizedFileURL
-            guard fileURL.path.hasPrefix(root.path) else {
-                DispatchQueue.main.async {
-                    guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
-                    urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorNoPermissionsToReadFile))
+            autoreleasepool {
+                var relPath = requestURL.path
+                while relPath.hasPrefix("/") {
+                    relPath.removeFirst()
                 }
-                return
-            }
-
-            guard FileManager.default.fileExists(atPath: fileURL.path),
-                  let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
-                DispatchQueue.main.async {
-                    guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
-                    let headers = ["Content-Type": "text/plain", "Access-Control-Allow-Origin": "*"]
-                    if let resp = HTTPURLResponse(url: requestURL, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: headers) {
-                        urlSchemeTask.didReceive(resp)
-                        urlSchemeTask.didReceive(Data("Not Found".utf8))
-                        urlSchemeTask.didFinish()
-                    } else {
-                        urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
-                    }
+                if relPath.isEmpty {
+                    relPath = "index.html"
                 }
-                return
-            }
 
-            let mime = Self.mimeType(for: fileURL.pathExtension)
-            let totalLen = data.count
-
-            if let rangeHeader = rangeHeader,
-               let (start, end) = Self.parseRange(header: rangeHeader, totalLength: totalLen) {
-                let slice = data.subdata(in: start..<(end + 1))
-                let headers: [String: String] = [
-                    "Content-Type": mime,
-                    "Accept-Ranges": "bytes",
-                    "Content-Length": "\(slice.count)",
-                    "Content-Range": "bytes \(start)-\(end)/\(totalLen)",
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "no-cache"
-                ]
-                if let resp = HTTPURLResponse(url: requestURL, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: headers) {
+                let fileURL = root.appendingPathComponent(relPath).resolvingSymlinksInPath().standardizedFileURL
+                guard fileURL.path.hasPrefix(root.path) else {
                     DispatchQueue.main.async {
                         guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
-                        urlSchemeTask.didReceive(resp)
-                        urlSchemeTask.didReceive(slice)
-                        urlSchemeTask.didFinish()
+                        urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorNoPermissionsToReadFile))
                     }
                     return
                 }
-            }
 
-            let headers: [String: String] = [
-                "Content-Type": mime,
-                "Accept-Ranges": "bytes",
-                "Content-Length": "\(totalLen)",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-cache"
-            ]
-            let response = HTTPURLResponse(url: requestURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
-            DispatchQueue.main.async {
-                guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
-                if let response = response {
-                    urlSchemeTask.didReceive(response)
-                    urlSchemeTask.didReceive(data)
-                    urlSchemeTask.didFinish()
-                } else {
-                    urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotParseResponse))
+                guard FileManager.default.fileExists(atPath: fileURL.path),
+                      let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
+                    DispatchQueue.main.async {
+                        guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                        let headers = [
+                            "Content-Type": "text/plain",
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                        ]
+                        if let resp = HTTPURLResponse(url: requestURL, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: headers) {
+                            urlSchemeTask.didReceive(resp)
+                            urlSchemeTask.didReceive(Data("Not Found".utf8))
+                            urlSchemeTask.didFinish()
+                        } else {
+                            urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorFileDoesNotExist))
+                        }
+                    }
+                    return
+                }
+
+                let mime = Self.mimeType(for: fileURL.pathExtension)
+                let totalLen = data.count
+
+                if let rangeHeader = rangeHeader,
+                   let (start, end) = Self.parseRange(header: rangeHeader, totalLength: totalLen) {
+                    let slice = data.subdata(in: start..<(end + 1))
+                    let headers: [String: String] = [
+                        "Content-Type": mime,
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": "\(slice.count)",
+                        "Content-Range": "bytes \(start)-\(end)/\(totalLen)",
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                    ]
+                    if let resp = HTTPURLResponse(url: requestURL, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: headers) {
+                        DispatchQueue.main.async {
+                            guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                            urlSchemeTask.didReceive(resp)
+                            urlSchemeTask.didReceive(slice)
+                            urlSchemeTask.didFinish()
+                        }
+                        return
+                    }
+                }
+
+                let headers: [String: String] = [
+                    "Content-Type": mime,
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": "\(totalLen)",
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"
+                ]
+                let response = HTTPURLResponse(url: requestURL, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
+                DispatchQueue.main.async {
+                    guard let self = self, self.activeTasks.remove(taskID) != nil else { return }
+                    if let response = response {
+                        urlSchemeTask.didReceive(response)
+                        urlSchemeTask.didReceive(data)
+                        urlSchemeTask.didFinish()
+                    } else {
+                        urlSchemeTask.didFailWithError(NSError(domain: NSURLErrorDomain, code: NSURLErrorCannotParseResponse))
+                    }
                 }
             }
         }

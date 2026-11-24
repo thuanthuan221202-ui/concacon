@@ -188,8 +188,7 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
       const outPath = path.join(mediaDir, `${base}.m4a`);
 
       try {
-        // For huge looping OST BGM tracks (> 1.8MB source, typically 5-9 min -> 120-202MB WebAudio Float32 RAM!),
-        // cap at 120s with a smooth 3s fade-out into Construct 2's seamless loop -> saves up to 158MB permanent RAM!
+        // Cap ultra-long looping OST tracks (>150s) smoothly at 120s with 3s fade-out (compact IPA + fallback safety)
         const srcSize = fs.statSync(inPath).size;
         let ffmpegArgs = [
           '-nostdin', '-y', '-loglevel', 'error',
@@ -242,7 +241,7 @@ async function convertAudioToM4a(mediaDir, skipAudio) {
 }
 
 export function patchConstruct2RuntimeAndHtml(wwwDir) {
-  console.log('[6/7] Patching Construct 2 runtime (iOS WebKit Jetsam RAM fix + VRAM LRU Eviction + on-demand GPU texture streaming)...');
+  console.log('[6/7] Patching Construct 2 runtime (Zero-Reload Fortress + Native Swift Audio + 3-Tier Hard VRAM Ceiling + Heap Trimming)...');
   const rtPath = path.join(wwwDir, 'c2runtime.js');
   let rt = fs.readFileSync(rtPath, 'utf8');
 
@@ -256,7 +255,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch isiPad detection');
   }
 
-  // 2. Route Music tracks through WebAudio API XMLHttpRequest on iOS custom scheme
+  // 2. Route Music tracks through WebAudio API only as fallback (when Native Swift Audio is unavailable)
   if (!rt.includes('this.runtime.isWKWebView || this.runtime.isiOS')) {
     const before = rt;
     rt = rt.replace(
@@ -264,6 +263,256 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
       'if (this.runtime.isWKWebView || this.runtime.isiOS) playMusicAsSoundWorkaround = true;'
     );
     if (rt === before) throw new Error('Failed to patch playMusicAsSoundWorkaround');
+  }
+
+  // 2b. Native Swift Audio Bridge: bypass WebContent AudioContext & PCM decode completely (saves 100-165MB WebContent RAM!)
+  if (!rt.includes('__z3NativeAudio')) {
+    const beforeNAInit = rt;
+    rt = rt.replace(
+      /context\s*=\s*null;\s*\r?\n\t\tif\s*\(typeof AudioContext !== "undefined"\)/,
+      `context = null;
+		var __useNativeAudio = !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio);
+		if (!__useNativeAudio) {
+		if (typeof AudioContext !== "undefined")`
+    );
+    rt = rt.replace(
+      /else if \(typeof webkitAudioContext !== "undefined"\)\s*\r?\n\t\t\t\tcontext = new webkitAudioContext\(\);\s*\r?\n\t\t\}/,
+      `else if (typeof webkitAudioContext !== "undefined")
+				context = new webkitAudioContext();
+		}
+		}`
+    );
+    if (rt === beforeNAInit) throw new Error('Failed to patch Native AudioContext skip');
+
+    // Inject JS-side synchronous state tracker + bridge helpers right before Cnds() in Audio plugin
+    const beforeNACnds = rt;
+    rt = rt.replace(
+      /Cnds\.prototype\.IsAnyPlaying\s*=\s*function\s*\(\)\s*\{/,
+      `var __z3NA = {
+		nextId: 1,
+		active: {},
+		lastId: 0,
+		hasBridge: function () {
+			return !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio);
+		},
+		post: function (payload) {
+			try {
+				if (this.hasBridge()) window.webkit.messageHandlers.z3Audio.postMessage(payload);
+			} catch (e) {}
+		},
+		play: function (src, tag, isMusic, looping, vol) {
+			if (silent) return;
+			if (isMusic) {
+				for (var mk in this.active) {
+					if (this.active.hasOwnProperty(mk) && this.active[mk].isMusic) {
+						delete this.active[mk];
+					}
+				}
+			}
+			var id = this.nextId++;
+			this.active[id] = { id: id, tag: tag || "", isMusic: !!isMusic, looping: !!looping, paused: false };
+			this.lastId = id;
+			this.post({ cmd: "play", id: id, src: src, tag: tag || "", isMusic: !!isMusic, looping: !!looping, volume: vol });
+		},
+		stop: function (tag) {
+			var tLow = (tag || "").toLowerCase();
+			if (!tLow) {
+				if (this.lastId && this.active[this.lastId]) delete this.active[this.lastId];
+			} else {
+				for (var k in this.active) {
+					if (this.active.hasOwnProperty(k) && this.active[k].tag.toLowerCase() === tLow) {
+						delete this.active[k];
+					}
+				}
+			}
+			this.post({ cmd: "stop", tag: tag || "" });
+		},
+		stopAll: function () {
+			this.active = {};
+			this.lastId = 0;
+			this.post({ cmd: "stopAll" });
+		},
+		isAnyPlaying: function () {
+			for (var k in this.active) {
+				if (this.active.hasOwnProperty(k) && !this.active[k].paused) return true;
+			}
+			return false;
+		},
+		isTagPlaying: function (tag) {
+			var tLow = (tag || "").toLowerCase();
+			if (!tLow) {
+				return !!(this.lastId && this.active[this.lastId] && !this.active[this.lastId].paused);
+			}
+			for (var k in this.active) {
+				if (this.active.hasOwnProperty(k) && !this.active[k].paused && this.active[k].tag.toLowerCase() === tLow) {
+					return true;
+				}
+			}
+			return false;
+		}
+	};
+	window["__z3NativeAudio"] = __z3NA;
+	window["__z3NativeAudioEnded"] = function (id) {
+		var tr = __z3NA.active[id];
+		if (!tr) return;
+		var endedTag = tr.tag || "";
+		delete __z3NA.active[id];
+		if (__z3NA.lastId === id) __z3NA.lastId = 0;
+		audTag = endedTag;
+		if (audRuntime && audInst) {
+			audRuntime.trigger(cr.plugins_.Audio.prototype.cnds.OnEnded, audInst);
+		}
+	};
+	Cnds.prototype.IsAnyPlaying = function ()
+	{
+		if (__z3NA.hasBridge())
+			return __z3NA.isAnyPlaying();`
+    );
+    if (rt === beforeNACnds) throw new Error('Failed to patch Native Audio IsAnyPlaying');
+
+    rt = rt.replace(
+      /Cnds\.prototype\.IsTagPlaying\s*=\s*function\s*\(tag\)\s*\{/,
+      `Cnds.prototype.IsTagPlaying = function (tag)
+	{
+		if (__z3NA.hasBridge())
+			return __z3NA.isTagPlaying(tag);`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.Play\s*=\s*function\s*\(file,\s*looping,\s*vol,\s*tag\)\s*\{\s*\r?\n\t\tif\s*\(silent\)\s*\r?\n\t\t\treturn;\s*\r?\n\t\tvar v = dbToLinear\(vol\);\s*\r?\n\t\tvar is_music = file\[1\];\s*\r?\n\t\tvar src = this\.runtime\.files_subfolder \+ file\[0\] \+ \(useOgg \? "\.ogg" : "\.m4a"\);/,
+      `Acts.prototype.Play = function (file, looping, vol, tag)
+	{
+		if (silent)
+			return;
+		var v = dbToLinear(vol);
+		var is_music = file[1];
+		var src = this.runtime.files_subfolder + file[0] + (useOgg ? ".ogg" : ".m4a");
+		if (__z3NA.hasBridge()) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.PlayByName\s*=\s*function\s*\(folder,\s*filename,\s*looping,\s*vol,\s*tag\)\s*\{\s*\r?\n\t\tif\s*\(silent\)\s*\r?\n\t\t\treturn;\s*\r?\n\t\tvar v = dbToLinear\(vol\);\s*\r?\n\t\tvar is_music = \(folder === 1\);\s*\r?\n\t\tvar src = this\.runtime\.files_subfolder \+ filename\.toLowerCase\(\) \+ \(useOgg \? "\.ogg" : "\.m4a"\);/,
+      `Acts.prototype.PlayByName = function (folder, filename, looping, vol, tag)
+	{
+		if (silent)
+			return;
+		var v = dbToLinear(vol);
+		var is_music = (folder === 1);
+		var src = this.runtime.files_subfolder + filename.toLowerCase() + (useOgg ? ".ogg" : ".m4a");
+		if (__z3NA.hasBridge()) { __z3NA.play(src, tag, is_music, looping !== 0, v); this.nextPlayTime = 0; return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetLooping\s*=\s*function\s*\(tag,\s*looping\)\s*\{/,
+      `Acts.prototype.SetLooping = function (tag, looping)
+	{
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setLooping", tag: tag || "", looping: looping === 0 }); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetMuted\s*=\s*function\s*\(tag,\s*muted\)\s*\{/,
+      `Acts.prototype.SetMuted = function (tag, muted)
+	{
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMuted", tag: tag || "", muted: muted === 0 }); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetVolume\s*=\s*function\s*\(tag,\s*vol\)\s*\{/,
+      `Acts.prototype.SetVolume = function (tag, vol)
+	{
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setVolume", tag: tag || "", volume: dbToLinear(vol) }); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.Stop\s*=\s*function\s*\(tag\)\s*\{/,
+      `Acts.prototype.Stop = function (tag)
+	{
+		if (__z3NA.hasBridge()) { __z3NA.stop(tag); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.StopAll\s*=\s*function\s*\(\)\s*\{/,
+      `Acts.prototype.StopAll = function ()
+	{
+		if (__z3NA.hasBridge()) { __z3NA.stopAll(); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetPaused\s*=\s*function\s*\(tag,\s*state\)\s*\{/,
+      `Acts.prototype.SetPaused = function (tag, state)
+	{
+		if (__z3NA.hasBridge()) {
+			var p = (state === 0);
+			var tLow = (tag || "").toLowerCase();
+			for (var pk in __z3NA.active) {
+				if (__z3NA.active.hasOwnProperty(pk) && (!tLow || __z3NA.active[pk].tag.toLowerCase() === tLow)) {
+					__z3NA.active[pk].paused = p;
+				}
+			}
+			__z3NA.post({ cmd: "setPaused", tag: tag || "", paused: p });
+			return;
+		}`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.Seek\s*=\s*function\s*\(tag,\s*pos\)\s*\{/,
+      `Acts.prototype.Seek = function (tag, pos)
+	{
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "seek", tag: tag || "", pos: pos }); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetSilent\s*=\s*function\s*\(s\)\s*\{\s*\r?\n\t\tvar i, len;\s*\r?\n\t\tif \(s === 2\)\s*\/\/ toggling\s*\r?\n\t\t\ts = \(silent \? 1 : 0\);\s*\/\/ choose opposite state/,
+      `Acts.prototype.SetSilent = function (s)
+	{
+		var i, len;
+		if (s === 2)
+			s = (silent ? 1 : 0);
+		if (__z3NA.hasBridge()) {
+			silent = (s === 0);
+			__z3NA.post({ cmd: "setSilent", silent: silent });
+			return;
+		}`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.SetMasterVolume\s*=\s*function\s*\(vol\)\s*\{\s*\r?\n\t\tmasterVolume = dbToLinear\(vol\);/,
+      `Acts.prototype.SetMasterVolume = function (vol)
+	{
+		masterVolume = dbToLinear(vol);
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "setMasterVolume", volume: masterVolume }); return; }`
+    );
+
+    rt = rt.replace(
+      /Acts\.prototype\.UnloadAll\s*=\s*function\s*\(\)\s*\{/,
+      `Acts.prototype.UnloadAll = function ()
+	{
+		if (__z3NA.hasBridge()) { __z3NA.post({ cmd: "unloadAll" }); }`
+    );
+
+    rt = rt.replace(
+      /instanceProto\.onSuspend\s*=\s*function\s*\(s\)\s*\{\s*\r?\n\t\tif\s*\(this\.playinbackground\)\s*\r?\n\t\t\treturn;/,
+      `instanceProto.onSuspend = function (s)
+	{
+		if (this.playinbackground)
+			return;
+		if (window["__z3NativeAudio"] && window["__z3NativeAudio"].hasBridge()) {
+			window["__z3NativeAudio"].post({ cmd: "setSuspended", suspended: !!s });
+			return;
+		}`
+    );
+  }
+
+  // 2c. STRICT JS RELOAD BAN: neutralize doContinuousPreviewReload & Browser Acts.prototype.Reload
+  if (!rt.includes('/* __z3ReloadBlocked */')) {
+    rt = rt.replace(
+      /function doContinuousPreviewReload\(\)\s*\{[\s\S]*?window\.location = window\.location \+ "\?continuous";\s*\r?\n\t\t\}\s*\r?\n\t\};/,
+      `function doContinuousPreviewReload() { /* __z3ReloadBlocked */ };`
+    );
+    rt = rt.replace(
+      /Acts\.prototype\.Reload\s*=\s*function\s*\(\)\s*\{\s*\r?\n\t\tif\s*\(!this\.is_arcade && !this\.runtime\.isDomFree\)\s*\r?\n\t\t\twindow\.location\.reload\(\);\s*\r?\n\t\};/,
+      `Acts.prototype.Reload = function () { /* __z3ReloadBlocked */ };`
+    );
   }
 
   // 3. Always use hardware-decoded .m4a (AAC)
@@ -276,8 +525,8 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch useOgg');
   }
 
-  // 4. Mark deferred non-loader-layout type initialization so 620 heavy character/stage sprite sheets
-  //    are NOT decoded into 1.75 GB of CPU HTMLImageElement RAM at startup (prevents iOS WebContent Jetsam OOM crash!)
+  // 4. Mark deferred non-loader-layout type initialization so 622 heavy character/stage sprite sheets
+  //    are NOT decoded into 1.75 GB of CPU HTMLImageElement RAM at startup
   if (!rt.includes('this.__inDeferredTypeInit = true;')) {
     const before = rt;
     rt = rt.replace(
@@ -291,9 +540,33 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch __inDeferredTypeInit');
   }
 
-  // 5. Replace eager new Image() in Sprite.Type.prototype.onCreate with lightweight lazy descriptor when deferred
+  // 4b. Free raw 60MB data.js JSON arrays immediately during loadProject BEFORE WebGL init!
+  if (!rt.includes('/* __z3FreePmArrays */')) {
+    const beforePm = rt;
+    rt = rt.replace(
+      /cr\.clearArray\(this\.objectRefTable\);\s*\r?\n\t\tthis\.initRendererAndLoader\(\);/,
+      `/* __z3FreePmArrays */
+		try {
+			if (pm) {
+				if (pm[5]) pm[5].length = 0;
+				if (pm[6]) pm[6].length = 0;
+			}
+		} catch (e) {}
+		cr.clearArray(this.objectRefTable);
+		this.initRendererAndLoader();`
+    );
+    if (rt === beforePm) console.warn('  [warn] Optional pm array release pattern not matched');
+  }
+
+  // 5. Replace eager new Image() in Sprite.Type.prototype.onCreate with lightweight lazy descriptor + share empty arrays
   if (!rt.includes('__isLazyProxy')) {
     const before = rt;
+    rt = rt.replace(
+      /frameobj\.image_points = frame\[9\];\s*\r?\n\t\t\t\tframeobj\.poly_pts = frame\[10\];/,
+      `var _emptySharedArr = window["__z3EmptyArr"] || (window["__z3EmptyArr"] = []);
+				frameobj.image_points = (frame[9] && frame[9].length) ? frame[9] : _emptySharedArr;
+				frameobj.poly_pts = (frame[10] && frame[10].length) ? frame[10] : _emptySharedArr;`
+    );
     rt = rt.replace(
       /frameobj\.texture_img\s*=\s*new Image\(\);\s*frameobj\.texture_img\.cr_src\s*=\s*frame\[0\];\s*frameobj\.texture_img\.cr_filesize\s*=\s*frame\[1\];\s*frameobj\.texture_img\.c2webGL_texture\s*=\s*null;\s*this\.runtime\.waitForImageLoad\(frameobj\.texture_img,\s*frame\[0\]\);/,
       `if (this.runtime.__inDeferredTypeInit) {
@@ -323,6 +596,18 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch Sprite lazy proxy');
   }
 
+  // 5b. Cleanly clear texQueue on WebGL context lost so context restores smoothly without reload
+  if (!rt.includes('__z3ContextLostClean')) {
+    rt = rt.replace(
+      /Runtime\.prototype\.onContextLost\s*=\s*function\s*\(\)\s*\{\s*\r?\n\t\tthis\.glwrap\.contextLost\(\);/,
+      `Runtime.prototype.onContextLost = function ()
+	{
+		/* __z3ContextLostClean */
+		if (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();
+		this.glwrap.contextLost();`
+    );
+  }
+
   // 6. Cap DevicePixelRatio to 2.0 (100% sharp Retina quality without 3x framebuffer bloat)
   if (!rt.includes('Math.min(2.0, (this.isRetina')) {
     const beforeDpr = rt;
@@ -333,7 +618,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
   }
 
-  // 6b. Release XHR reference immediately after loadProject so 58MB data.js buffer is freed by GC
+  // 6b. Release XHR reference immediately after loadProject so 60MB data.js buffer is freed by GC
   if (!rt.includes('xhr.onload = null; xhr.onerror = null;')) {
     const beforeXhr = rt;
     rt = rt.replace(
@@ -343,7 +628,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === beforeXhr) console.warn('  [warn] Optional XHR cleanup pattern not matched');
   }
 
-  // 7. On-demand WebGL texture upload + Synchronous Pre-Upload Eviction (100% original full-res sprites)
+  // 7. On-demand WebGL texture upload + Evict-BEFORE-Decode + 3-Tier Unbypassable Hard VRAM Ceiling (100% original full-res sprites!)
   if (!rt.includes('c2lazyLoadFunc')) {
     const beforeGL = rt;
     rt = rt.replace(
@@ -407,6 +692,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			webGL_texture.c2isLoaded = false;
 			webGL_texture.c2loading = false;
 			webGL_texture.c2lastUsedTime = Date.now();
+			webGL_texture.c2lastTick = 0;
 			all_textures.push(webGL_texture);
 			textures_by_src[tex_key] = webGL_texture;
 
@@ -427,13 +713,19 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			var uploadBytes = (img.width || 256) * (img.height || 256) * 4;
 			webGL_texture.c2lazyLoadFunc = function (doneCb) {
 				if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
-					if (doneCb) doneCb();
+					if (doneCb) doneCb(false);
 					return;
 				}
+				// CRITICAL: Evict BEFORE fetch/createImageBitmap so old 16MB Metal pages are freed BEFORE allocating CPU decode buffer!
+				var evictedBefore = false;
+				if (selfGL.evictForBudget) {
+					evictedBefore = !!selfGL.evictForBudget(uploadBytes, webGL_texture);
+				}
 				function onUpload(source) {
+					var didEvict = evictedBefore;
 					if (!webGL_texture.c2deleted) {
 						if (selfGL.evictForBudget) {
-							selfGL.evictForBudget(uploadBytes);
+							if (selfGL.evictForBudget(uploadBytes, webGL_texture)) didEvict = true;
 						}
 						selfGL.endBatch();
 						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
@@ -446,29 +738,38 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						webGL_texture.c2loading = false;
 						webGL_texture.c2lastUsedTime = Date.now();
 						var rtInst = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
-						if (rtInst) rtInst.redraw = true;
+						if (rtInst) {
+							webGL_texture.c2lastTick = rtInst.tickcount || 0;
+							rtInst.redraw = true;
+						}
 					}
-					if (doneCb) doneCb();
+					if (doneCb) doneCb(didEvict);
 				}
-				if (typeof createImageBitmap === "function" && typeof fetch === "function") {
-					fetch(texSrc, { cache: "no-store" })
-						.then(function (res) {
-							if (!res.ok) throw new Error("Fetch failed: " + res.status);
-							return res.blob();
-						})
-						.then(function (blob) { return createImageBitmap(blob); })
-						.then(function (bitmap) {
-							try {
-								onUpload(bitmap);
-							} finally {
-								if (bitmap && bitmap.close) bitmap.close();
-							}
-						})
-						.catch(function () {
-							fallbackImage();
-						});
-				} else {
-					fallbackImage();
+				function startDecode() {
+					if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
+						if (doneCb) doneCb(false);
+						return;
+					}
+					if (typeof createImageBitmap === "function" && typeof fetch === "function") {
+						fetch(texSrc, { cache: "no-store" })
+							.then(function (res) {
+								if (!res.ok) throw new Error("Fetch failed: " + res.status);
+								return res.blob();
+							})
+							.then(function (blob) { return createImageBitmap(blob); })
+							.then(function (bitmap) {
+								try {
+									onUpload(bitmap);
+								} finally {
+									if (bitmap && bitmap.close) bitmap.close();
+								}
+							})
+							.catch(function () {
+								fallbackImage();
+							});
+					} else {
+						fallbackImage();
+					}
 				}
 				function fallbackImage() {
 					var realImg = new Image();
@@ -485,9 +786,15 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						realImg.onerror = null;
 						realImg.src = "";
 						realImg = null;
-						if (doneCb) doneCb();
+						if (doneCb) doneCb(false);
 					};
 					realImg.src = texSrc;
+				}
+				// If we just evicted heavy textures before a >=4MB upload, yield 1 frame so Metal/autorelease pool reclaims GPU pages first
+				if (evictedBefore && uploadBytes >= 4194304 && typeof requestAnimationFrame === "function") {
+					requestAnimationFrame(startDecode);
+				} else {
+					startDecode();
 				}
 			};
 			return webGL_texture;
@@ -495,7 +802,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeGL) throw new Error('Failed to patch GLWrap loadTexture');
 
-    // 8. Load textures on demand when GLWrap_.setTexture is called + refresh lastUsedTime
+    // 8. Load textures on demand when GLWrap_.setTexture is called + refresh lastUsedTime & lastTick
     const beforeST = rt;
     rt = rt.replace(
       /GLWrap_\.prototype\.setTexture\s*=\s*function\s*\(tex\)\s*\{/,
@@ -504,6 +811,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (tex)
 		{
 			tex.c2lastUsedTime = Date.now();
+			tex.c2lastTick = window["__z3CurTick"] || 0;
 			if (!tex.c2isLoaded && !tex.c2loading && tex.c2lazyLoadFunc)
 			{
 				tex.c2loading = true;
@@ -513,7 +821,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeST) throw new Error('Failed to patch setTexture');
 
-    // 9. Strict Synchronous VRAM LRU Eviction & Dynamic Budget inside GLWrap_ (44MB normal / 24MB Low-RAM Shield)
+    // 9. 3-Tier UNBYPASSABLE Hard VRAM Ceiling + Dynamic Pressure Scaling + Synchronous gl.finish() Metal Reclaim
     const beforeDel = rt;
     rt = rt.replace(
       /this\.gl\.deleteTexture\(tex\);\s*\r?\n\t\};/,
@@ -521,6 +829,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		this.gl.deleteTexture(tex);
 	};
 	var blankPixel1x1 = new Uint8Array([0, 0, 0, 0]);
+	window["__c2MemPressure"] = 0;
+	window["__c2SetMemoryPressure"] = function (lvl) {
+		window["__c2MemPressure"] = (lvl === 2) ? 2 : ((lvl === 1) ? 1 : 0);
+	};
 	GLWrap_.prototype.getEstimatedVRAM = function ()
 	{
 		var total = 0;
@@ -532,13 +844,20 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		}
 		return total;
 	};
-	GLWrap_.prototype.evictUnusedTextures = function (forceAll, incomingBytes)
+	GLWrap_.prototype.evictUnusedTextures = function (forceAll, incomingBytes, protectTex)
 	{
 		var now = Date.now();
-		var SOFT_BUDGET = 96 * 1024 * 1024;
-		var HARD_CEILING = 128 * 1024 * 1024;
-		var HARD_TARGET = 104 * 1024 * 1024;
-		var UNUSED_THRESHOLD = incomingBytes ? 8000 : 12000;
+		var curTick = window["__z3CurTick"] || 0;
+		var pressure = window["__c2MemPressure"] || 0;
+		var MB = 1024 * 1024;
+		// Dynamic pressure-scaled budgets: 100% sharp sprites, NEVER exceeds hard ceiling!
+		var SOFT_BUDGET = (pressure >= 2) ? (28 * MB) : ((pressure === 1) ? (44 * MB) : (64 * MB));
+		var HARD_CEILING = (pressure >= 2) ? (44 * MB) : ((pressure === 1) ? (64 * MB) : (88 * MB));
+		var HARD_TARGET = (pressure >= 2) ? (32 * MB) : ((pressure === 1) ? (48 * MB) : (68 * MB));
+		var PANIC_CEILING = (pressure >= 2) ? (52 * MB) : ((pressure === 1) ? (76 * MB) : (104 * MB));
+		var PANIC_TARGET = (pressure >= 2) ? (36 * MB) : ((pressure === 1) ? (52 * MB) : (72 * MB));
+		var UNUSED_THRESHOLD = (pressure >= 2) ? 600 : ((pressure === 1) ? 2000 : (incomingBytes ? 3000 : 6000));
+
 		var totalVRAM = incomingBytes || 0;
 		var loadedList = [];
 		var i, len, t;
@@ -554,11 +873,15 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (totalVRAM > SOFT_BUDGET || forceAll)
 		{
 			loadedList.sort(function (a, b) {
+				var dtTick = (a.c2lastTick || 0) - (b.c2lastTick || 0);
+				if (dtTick !== 0) return dtTick;
 				return (a.c2lastUsedTime || 0) - (b.c2lastUsedTime || 0);
 			});
 			this.endBatch();
 			var gl = this.gl;
 			var evictedCount = 0;
+			var hardEvicted = false;
+			var selfGLRef = this;
 			function evictOne(texObj) {
 				gl.bindTexture(gl.TEXTURE_2D, texObj);
 				gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, blankPixel1x1);
@@ -571,11 +894,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (texObj === selfGLRef.lastTexture1)
 					selfGLRef.lastTexture1 = null;
 			}
-			var selfGLRef = this;
-			// Pass 1: Smooth eviction (only textures idle >= 8s/12s -> zero active character flicker)
+			// Pass 1: Smooth LRU eviction (textures idle >= UNUSED_THRESHOLD -> zero visible flicker)
 			for (i = 0, len = loadedList.length; i < len; i++)
 			{
 				t = loadedList[i];
+				if (t === protectTex) continue;
 				var age = now - (t.c2lastUsedTime || 0);
 				if (!forceAll && age < UNUSED_THRESHOLD)
 					continue;
@@ -583,39 +906,77 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (!forceAll && totalVRAM <= SOFT_BUDGET)
 					break;
 			}
-			// Pass 2: Hard Emergency Ceiling during heavy 5-7 sheet Special/Ultimate/Cutscene bursts!
-			// Never let VRAM exceed 128MB: evict textures not drawn in last 400ms down to 104MB
+			// Pass 2: Hard Ceiling (evict textures not drawn in last 150ms down to HARD_TARGET)
 			if (!forceAll && totalVRAM > HARD_CEILING)
 			{
 				for (i = 0, len = loadedList.length; i < len; i++)
 				{
 					t = loadedList[i];
-					if (!t.c2isLoaded)
+					if (!t.c2isLoaded || t === protectTex)
 						continue;
 					var age2 = now - (t.c2lastUsedTime || 0);
-					if (age2 < 400)
+					if (age2 < 150)
 						continue;
 					evictOne(t);
+					hardEvicted = true;
 					if (totalVRAM <= HARD_TARGET)
 						break;
 				}
 			}
+			// Pass 3: UNBYPASSABLE PANIC CEILING during multi-sheet Special/Ultimate/Cutscene bursts!
+			// Never let VRAM exceed PANIC_CEILING even when 10 sheets animate within 150ms!
+			if (!forceAll && totalVRAM > PANIC_CEILING)
+			{
+				// 3a: Evict any texture NOT drawn on exact current tick
+				for (i = 0, len = loadedList.length; i < len; i++)
+				{
+					t = loadedList[i];
+					if (!t.c2isLoaded || t === protectTex)
+						continue;
+					if (curTick > 0 && t.c2lastTick === curTick)
+						continue;
+					evictOne(t);
+					hardEvicted = true;
+					if (totalVRAM <= PANIC_TARGET)
+						break;
+				}
+				// 3b: Last-resort unconditional cap (prevents Jetsam kill 100%!)
+				if (totalVRAM > PANIC_CEILING)
+				{
+					for (i = 0, len = loadedList.length; i < len; i++)
+					{
+						t = loadedList[i];
+						if (!t.c2isLoaded || t === protectTex)
+							continue;
+						evictOne(t);
+						hardEvicted = true;
+						if (totalVRAM <= PANIC_TARGET)
+							break;
+					}
+				}
+			}
 			gl.bindTexture(gl.TEXTURE_2D, null);
-			// Immediately commit 1x1 replacements to Apple Metal driver so evicted 16MB GPU pages are freed NOW
+			// Synchronously retire Metal GPU command buffer on hard/force eviction so 16MB GPU pages free IMMEDIATELY!
 			if (evictedCount > 0)
 			{
-				gl.flush();
+				if (forceAll || hardEvicted) {
+					try { gl.finish(); } catch (e) { gl.flush(); }
+				} else {
+					gl.flush();
+				}
 			}
+			return evictedCount > 0;
 		}
+		return false;
 	};
-	GLWrap_.prototype.evictForBudget = function (incomingBytes)
+	GLWrap_.prototype.evictForBudget = function (incomingBytes, protectTex)
 	{
-		this.evictUnusedTextures(false, incomingBytes || 0);
+		return this.evictUnusedTextures(false, incomingBytes || 0, protectTex || null);
 	};`
     );
     if (rt === beforeDel) throw new Error('Failed to patch GLWrap deleteTexture and evictUnusedTextures');
 
-    // 10. Periodic VRAM eviction check in Runtime.prototype.tick (every 120 ticks ~2s)
+    // 10. Periodic VRAM eviction check in Runtime.prototype.tick (every 60 ticks ~1s) + track __z3CurTick
     const beforeTickSweep = rt;
     rt = rt.replace(
       /Runtime\.prototype\.tick\s*=\s*function\s*\(background_wake,\s*timestamp,\s*debug_step\)\s*\{\s*\r?\n\t\tif\s*\(!this\.running_layout\)\s*\r?\n\t\t\treturn;/,
@@ -623,10 +984,11 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	{
 		if (!this.running_layout)
 			return;
+		window["__z3CurTick"] = this.tickcount || 0;
 		if (this.glwrap && this.glwrap.evictUnusedTextures)
 		{
 			this.__vramCheckCounter = (this.__vramCheckCounter || 0) + 1;
-			if (this.__vramCheckCounter >= 120)
+			if (this.__vramCheckCounter >= 60)
 			{
 				this.__vramCheckCounter = 0;
 				this.glwrap.evictUnusedTextures(false);
@@ -639,7 +1001,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeTickSweep) throw new Error('Failed to patch Runtime.prototype.tick VRAM sweep');
 
-    // 11. Patch typeProto.loadTextures: pure on-demand loading (only tiny <=4 frame UI icons < 1MB load eagerly)
+    // 11. Patch typeProto.loadTextures: pure on-demand loading (only tiny <=4 frame UI icons < 512KB load eagerly)
     const beforeLT = rt;
     rt = rt.replace(
       /typeProto\.loadTextures\s*=\s*function\s*\(\)\s*\{\s*\r?\n\t\tif\s*\(this\.is_family\s*\|\|\s*this\.has_loaded_textures\s*\|\|\s*!this\.runtime\.glwrap\)\s*\r?\n\t\t\treturn;\s*\r?\n\t\tvar\s*i,\s*len,\s*frame;\s*\r?\n\t\tfor\s*\(i\s*=\s*0,\s*len\s*=\s*this\.all_frames\.length;\s*i\s*<\s*len;\s*\+\+i\)\s*\{\s*\r?\n\t\t\tframe\s*=\s*this\.all_frames\[i\];\s*\r?\n\t\t\tframe\.webGL_texture\s*=\s*this\.runtime\.glwrap\.loadTexture\(frame\.texture_img,\s*false,\s*this\.runtime\.linearSampling,\s*frame\.pixelformat\);\s*\r?\n\t\t\}\s*\r?\n\t\tthis\.has_loaded_textures\s*=\s*true;\s*\r?\n\t\};/,
@@ -653,7 +1015,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			frame = this.all_frames[i];
 			frame.webGL_texture = this.runtime.glwrap.loadTexture(frame.texture_img, false, this.runtime.linearSampling, frame.pixelformat);
-			if (tinyType && frame.webGL_texture && (frame.webGL_texture.c2bytes || 0) <= 1048576 && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
+			if (tinyType && frame.webGL_texture && (frame.webGL_texture.c2bytes || 0) <= 524288 && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
 			{
 				frame.webGL_texture.c2loading = true;
 				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc, frame.webGL_texture);
@@ -664,22 +1026,26 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeLT) throw new Error('Failed to patch typeProto.loadTextures');
 
-    // 12. (Removed eager anim[0] preload on Sprite create — prevents 170MB invisible/Special VRAM spike at battle start!)
-
-    // 13. Preload max 2 upcoming frames in doChangeAnim ONLY if instance is visible
+    // 13. Smart minimal preload in doChangeAnim (frame 0 only for large sheets; frame 1 only if <=4MB and VRAM under budget)
     const beforeDCA = rt;
     rt = rt.replace(
       /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
-      `if (this.visible && this.opacity > 0 && anim && anim.frames)
+      `if (this.visible && this.opacity > 0 && anim && anim.frames && anim.frames.length > 0)
 		{
-			var _maxPre = Math.min(anim.frames.length, 2);
-			for (var _ai = 0; _ai < _maxPre; _ai++)
+			var _f0 = anim.frames[0].webGL_texture;
+			if (_f0 && !_f0.c2isLoaded && !_f0.c2loading && _f0.c2lazyLoadFunc)
 			{
-				var _atex = anim.frames[_ai].webGL_texture;
-				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
+				_f0.c2loading = true;
+				window["__c2EnqueueLazyTex"](_f0.c2lazyLoadFunc, _f0, true);
+			}
+			if (anim.frames.length > 1)
+			{
+				var _f1 = anim.frames[1].webGL_texture;
+				var _curVram = (this.runtime.glwrap && this.runtime.glwrap.getEstimatedVRAM) ? this.runtime.glwrap.getEstimatedVRAM() : 0;
+				if (_f1 && _f1 !== _f0 && (_f1.c2bytes || 0) <= 4194304 && _curVram < 48 * 1024 * 1024 && !_f1.c2isLoaded && !_f1.c2loading && _f1.c2lazyLoadFunc)
 				{
-					_atex.c2loading = true;
-					window["__c2EnqueueLazyTex"](_atex.c2lazyLoadFunc, _atex);
+					_f1.c2loading = true;
+					window["__c2EnqueueLazyTex"](_f1.c2lazyLoadFunc, _f1, false);
 				}
 			}
 		}
@@ -721,12 +1087,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeDrawGL) throw new Error('Failed to patch Sprite drawGL anti-flicker');
 
-    // 14. Audio buffer LRU trimming in getAudioBuffer + __c2PurgeMemory
+    // 14. Audio buffer LRU trimming (for desktop fallback) + Multi-Level Zero-Reload Emergency Purge (__c2EmergencyPurge / __c2PurgeMemory)
     const beforeAudio = rt;
     rt = rt.replace(
       /instanceProto\.getAudioBuffer\s*=\s*function\s*\(src_,\s*is_music,\s*dont_create\)\s*\{\s*\r?\n\t\tvar\s*i,\s*len,\s*a,\s*ret\s*=\s*null,\s*j,\s*k,\s*lenj,\s*ai;/,
       `window.__c2TrimAudioBuffers = function (forceAll) {
-		var keepLimit = 4;
+		var keepLimit = 2;
 		for (var ti = audioBuffers.length - 1; ti >= 0; ti--) {
 			var b = audioBuffers[ti];
 			if (b && !b.is_music) {
@@ -746,20 +1112,51 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			}
 		}
 	};
-	window.__c2PurgeMemory = function () {
-		if (window.__c2ClearTexQueue) {
+	window.__c2EmergencyPurge = function (level) {
+		var lvl = (typeof level === "number") ? level : 2;
+		if (lvl >= 2 && window.__c2ClearTexQueue) {
 			window.__c2ClearTexQueue();
+		} else if (lvl === 1 && window.__c2TrimTexQueue) {
+			window.__c2TrimTexQueue();
 		}
 		var rt = window["cr_getC2Runtime"] && window["cr_getC2Runtime"]();
-		if (rt && rt.glwrap && rt.glwrap.evictUnusedTextures) {
-			rt.glwrap.evictUnusedTextures(true);
+		if (rt) {
+			// Clear recycled deadCache pools to release stale JS instances
+			if (rt.types_by_index) {
+				for (var di = 0; di < rt.types_by_index.length; di++) {
+					var dt = rt.types_by_index[di];
+					if (dt && dt.deadCache && dt.deadCache.length > 0) {
+						dt.deadCache.length = 0;
+					}
+				}
+			}
+			if (rt.glwrap && rt.glwrap.evictUnusedTextures) {
+				if (lvl >= 2) {
+					rt.glwrap.evictUnusedTextures(true);
+				} else {
+					var prevP = window["__c2MemPressure"] || 0;
+					window["__c2MemPressure"] = Math.max(prevP, 1);
+					rt.glwrap.evictUnusedTextures(false, 24 * 1024 * 1024);
+				}
+			}
 		}
 		if (window.__c2TrimAudioBuffers) {
-			window.__c2TrimAudioBuffers(true);
+			window.__c2TrimAudioBuffers(lvl >= 2);
+		}
+		if (window["__z3NativeAudio"] && window["__z3NativeAudio"].hasBridge()) {
+			window["__z3NativeAudio"].post({ cmd: "purgeCache" });
 		}
 		if (rt && rt.gl) {
-			try { rt.gl.flush(); rt.gl.finish(); } catch (e) {}
+			try {
+				if (lvl >= 2) { rt.gl.finish(); } else { rt.gl.flush(); }
+			} catch (e) {}
 		}
+		try {
+			if (window.performance && performance.clearResourceTimings) performance.clearResourceTimings();
+		} catch (e) {}
+	};
+	window.__c2PurgeMemory = function () {
+		window.__c2EmergencyPurge(2);
 	};
 	instanceProto.getAudioBuffer = function (src_, is_music, dont_create)
 	{
@@ -771,7 +1168,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			if (playMusicAsSoundWorkaround && is_music)
 				this.releaseAllMusicBuffers();
-			if (!is_music && audioBuffers.length >= 8 && window.__c2TrimAudioBuffers)
+			if (!is_music && audioBuffers.length >= 4 && window.__c2TrimAudioBuffers)
 				window.__c2TrimAudioBuffers(false);
 			ret = new C2AudioBuffer(src_, is_music);
 			audioBuffers.push(ret);
@@ -779,14 +1176,17 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeAudio) throw new Error('Failed to patch AudioBuffer LRU trimming');
 
-    // 15. Purge pending texture load queue & VRAM on layout switch
+    // 15. Full VRAM + deadCache + Native WebKit cache purge on every layout switch
     const beforeCL = rt;
     rt = rt.replace(
       /this\.running_layout\.stopRunning\(\);/,
       `this.running_layout.stopRunning();
-		if (window["__c2ClearTexQueue"]) window["__c2ClearTexQueue"]();
-		if (this.glwrap && this.glwrap.evictUnusedTextures) this.glwrap.evictUnusedTextures(true);
-		if (window["__c2TrimAudioBuffers"]) window["__c2TrimAudioBuffers"](true);
+		if (window["__c2EmergencyPurge"]) window["__c2EmergencyPurge"](2);
+		try {
+			if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3NativeClean) {
+				window.webkit.messageHandlers.z3NativeClean.postMessage("layout_switch");
+			}
+		} catch (e) {}
 		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"]("");`
     );
     rt = rt.replace(
@@ -837,7 +1237,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	}
 	`;
 
-    // Patch Keyboard.prototype.Instance onKeyDown and onKeyUp
     const beforeKD = rt;
     rt = rt.replace(
       /instanceProto\.onKeyDown\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tvar alreadyPreventedDefault = false;/,
@@ -866,7 +1265,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		this.keyMap[info.which] = false;`
     );
 
-    // Patch Touch.prototype.Instance onPointerStart, onTouchStart, onMouseDown
     const beforeTouch = rt;
     rt = rt.replace(
       /instanceProto\.onPointerStart\s*=\s*function\s*\(info\)\s*\{\s*\r?\n\t\tif\s*\(info\["pointerType"\] === info\["MSPOINTER_TYPE_MOUSE"\] \|\| info\["pointerType"\] === "mouse"\)\s*\r?\n\t\t\treturn;/,
@@ -932,20 +1330,45 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     </style>
     <script>
     (function () {
-        // Clean up any legacy Low-RAM flag so graphics always stay 100% native sharp
+        // 1. Clean up any legacy Low-RAM flag so graphics always stay 100% native sharp
         try { localStorage.removeItem("Z3_LOW_RAM_MODE"); } catch (e) {}
 
-        // Throttled on-demand GPU texture loader queue (concurrency 1 = halves peak PNG decode RAM spike!)
+        // 2. STRICT JS RELOAD LOCKDOWN (combined with native WKNavigationDelegate reload cancellation)
+        try {
+            if (window.Location && Location.prototype) {
+                Object.defineProperty(Location.prototype, "reload", {
+                    value: function () { /* Strictly blocked */ },
+                    writable: false,
+                    configurable: false
+                });
+            }
+        } catch (e) {}
+        try {
+            if (window.history && History.prototype) {
+                var _origGo = History.prototype.go;
+                History.prototype.go = function (delta) {
+                    if (!delta || delta === 0) return;
+                    return _origGo.apply(this, arguments);
+                };
+            }
+        } catch (e) {}
+
+        // 3. Bounded, throttled on-demand GPU texture loader queue (concurrency 1 + rAF Metal reclaim yield!)
         var texQueue = [];
         var activeTexLoads = 0;
         var MAX_TEX_CONCURRENCY = 1;
+        var MAX_TEX_QUEUE = 8;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
                 activeTexLoads++;
                 var job = texQueue.shift();
-                job(function () {
+                job(function (didEvict) {
                     activeTexLoads--;
-                    setTimeout(pumpTexQueue, 4);
+                    if (didEvict && typeof requestAnimationFrame === "function") {
+                        requestAnimationFrame(pumpTexQueue);
+                    } else {
+                        setTimeout(pumpTexQueue, 4);
+                    }
                 });
             }
         }
@@ -959,6 +1382,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
                     return;
                 }
             }
+            if (texQueue.length >= MAX_TEX_QUEUE) {
+                var dropped = texQueue.pop();
+                if (dropped && dropped.tex) dropped.tex.c2loading = false;
+            }
             job.tex = tex;
             if (highPriority) {
                 texQueue.unshift(job);
@@ -966,6 +1393,12 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
                 texQueue.push(job);
             }
             pumpTexQueue();
+        };
+        window.__c2TrimTexQueue = function () {
+            while (texQueue.length > 2) {
+                var dropped = texQueue.pop();
+                if (dropped && dropped.tex) dropped.tex.c2loading = false;
+            }
         };
         window.__c2ClearTexQueue = function () {
             for (var i = 0; i < texQueue.length; i++) {
@@ -976,6 +1409,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
             texQueue.length = 0;
         };
 
+        // 4. AudioContext resume helper (only used for Z-Hub mini-wheel synth or desktop fallback)
         var contexts = [];
         var OrigAC = window.AudioContext || window.webkitAudioContext;
         if (OrigAC) {
@@ -1025,6 +1459,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
         document.addEventListener("visibilitychange", function () {
             if (window.cr_setSuspended) {
                 cr_setSuspended(Boolean(document.hidden));
+            }
+            if (document.hidden && window.__c2EmergencyPurge) {
+                window.__c2EmergencyPurge(2);
             }
         }, false);
     </script>
