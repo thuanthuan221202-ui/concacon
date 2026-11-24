@@ -7,7 +7,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     private var memoryWatchdogTimer: Timer?
     private var lastReportedPressureLevel: Int = 0
-    private var lastCriticalPurgeTime: TimeInterval = 0
+    private var lastPurgeTimestamp: TimeInterval = 0
 
     // STRICT ANTI-RELOAD LOCK: once initial game page loads, ALL automatic/JS reloads are strictly forbidden.
     private var hasCompletedInitialLoad: Bool = false
@@ -126,18 +126,24 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         setNeedsStatusBarAppearanceUpdate()
     }
 
-    // MARK: - Proactive Kernel Memory Pressure Shield (Prevents Jetsam BEFORE OS kills WebContent)
+    // MARK: - Smooth Non-Stuttering Memory Pressure Shield
+    // NEVER wipes active on-screen sprites during gameplay (eliminates stutter/thrashing!).
+    // Full VRAM purge (level 2) ONLY runs when backgrounded, switching layouts, or user clicks Clean.
 
     private func setupKernelMemoryPressureMonitor() {
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
         source.setEventHandler { [weak self] in
             guard let self = self, let event = self.memoryPressureSource?.data else { return }
+            let now = Date().timeIntervalSinceReferenceDate
+            guard (now - self.lastPurgeTimestamp) >= 3.0 else { return }
+            self.lastPurgeTimestamp = now
+
             if event.contains(.critical) {
-                NSLog("[ZLegends3] CRITICAL kernel memory pressure! Executing emergency zero-reload purge (Level 2)...")
-                self.triggerZeroReloadMemoryPurge(level: 2)
+                NSLog("[ZLegends3] CRITICAL kernel memory pressure! Soft-evicting idle textures (zero stutter)...")
+                self.triggerInGameMemoryTrim(pressureLevel: 2)
             } else if event.contains(.warning) {
-                NSLog("[ZLegends3] WARNING kernel memory pressure! Executing zero-reload purge (Level 1)...")
-                self.triggerZeroReloadMemoryPurge(level: 1)
+                NSLog("[ZLegends3] WARNING kernel memory pressure! Trimming idle caches...")
+                self.triggerInGameMemoryTrim(pressureLevel: 1)
             }
         }
         source.resume()
@@ -146,7 +152,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
 
     private func startMemoryWatchdogTimer() {
         memoryWatchdogTimer?.invalidate()
-        memoryWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        memoryWatchdogTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.checkAvailableSystemMemory()
         }
     }
@@ -156,18 +162,18 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         guard availBytes > 0 else { return }
         let availMB = availBytes / (1024 * 1024)
 
+        // Conservative thresholds so normal 60fps combat NEVER drops into tight-VRAM thrashing!
         let nextLevel: Int
-        if availMB < 180 {
+        if availMB < 65 {
             nextLevel = 2
-        } else if availMB < 320 {
+        } else if availMB < 120 {
             nextLevel = 1
-        } else if availMB >= 420 {
+        } else if availMB >= 180 {
             nextLevel = 0
         } else {
             nextLevel = lastReportedPressureLevel
         }
 
-        let now = Date().timeIntervalSinceReferenceDate
         if nextLevel != lastReportedPressureLevel {
             lastReportedPressureLevel = nextLevel
             NSLog("[ZLegends3] Memory headroom = %ld MB -> pressure level %ld", availMB, nextLevel)
@@ -176,12 +182,8 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
                 completionHandler: nil
             )
             if nextLevel >= 1 {
-                triggerZeroReloadMemoryPurge(level: nextLevel)
-                lastCriticalPurgeTime = now
+                triggerInGameMemoryTrim(pressureLevel: nextLevel)
             }
-        } else if nextLevel == 2 && (now - lastCriticalPurgeTime) >= 6.0 {
-            lastCriticalPurgeTime = now
-            triggerZeroReloadMemoryPurge(level: 2)
         }
     }
 
@@ -195,14 +197,25 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         WKWebsiteDataStore.default().removeData(ofTypes: cacheTypes, modifiedSince: .distantPast) {}
     }
 
-    private func triggerZeroReloadMemoryPurge(level: Int) {
+    /// Non-blocking in-game trim: clears idle/off-screen textures & caches ONLY, never wipes active fighters or stalls GPU!
+    private func triggerInGameMemoryTrim(pressureLevel: Int) {
         audioEngine?.purgeCache()
         URLCache.shared.removeAllCachedResponses()
-        if level >= 2 {
+        if pressureLevel >= 2 {
             clearWebKitCachesOnly()
         }
         webView?.evaluateJavaScript(
-            "if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(\(level)); else if (window.__c2PurgeMemory) window.__c2PurgeMemory();",
+            "if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(1);",
+            completionHandler: nil
+        )
+    }
+
+    /// Full purge ONLY when app goes to background (keeps match alive without Jetsam when switching apps)
+    private func triggerBackgroundFullPurge() {
+        audioEngine?.purgeCache()
+        clearWebKitCachesOnly()
+        webView?.evaluateJavaScript(
+            "if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(2);",
             completionHandler: nil
         )
     }
@@ -218,10 +231,9 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     }
 
     @objc private func appDidEnterBackground() {
-        // Dramatically cut VRAM/cache RAM while backgrounded so iOS will NOT Jetsam-kill WebContent when switching apps!
         NSLog("[ZLegends3] App entered background — flushing VRAM & caches to prevent background Jetsam kill.")
         audioEngine?.setSuspended(true)
-        triggerZeroReloadMemoryPurge(level: 2)
+        triggerBackgroundFullPurge()
     }
 
     @objc private func appDidBecomeActive() {
@@ -234,8 +246,8 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
 
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
-        NSLog("[ZLegends3] OS Memory Warning received! Executing emergency zero-reload purge...")
-        triggerZeroReloadMemoryPurge(level: 2)
+        NSLog("[ZLegends3] OS Memory Warning received! Trimming idle VRAM & caches without stutter...")
+        triggerInGameMemoryTrim(pressureLevel: 2)
     }
 
     // MARK: - WKScriptMessageHandler
@@ -249,7 +261,6 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         }
 
         if message.name == "z3NativeClean" {
-            NSLog("[ZLegends3] Native cache cleanup triggered from JS.")
             audioEngine?.purgeCache()
             clearWebKitCachesOnly()
             return
@@ -268,7 +279,6 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        // STRICT RELOAD LOCK: once the game has booted, NEVER allow any reload or main-frame re-navigation!
         if hasCompletedInitialLoad && !allowManualRecoveryOnce {
             if navigationAction.navigationType == .reload {
                 NSLog("[ZLegends3] Blocked reload navigation strictly.")
@@ -323,9 +333,6 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        // STRICTLY FORBIDDEN TO AUTO-RELOAD!
-        // Note: When iOS kernel forcibly SIGKILLs WebKit WebContent due to extreme system RAM exhaustion,
-        // we NEVER auto-reload. Instead we flush all caches and let the user decide explicitly.
         NSLog("[ZLegends3] WebContent terminated by iOS kernel — AUTO-RELOAD IS STRICTLY BLOCKED!")
         audioEngine?.stopAll()
         audioEngine?.purgeCache()

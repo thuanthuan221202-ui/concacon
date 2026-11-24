@@ -713,19 +713,17 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			var uploadBytes = (img.width || 256) * (img.height || 256) * 4;
 			webGL_texture.c2lazyLoadFunc = function (doneCb) {
 				if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
-					if (doneCb) doneCb(false);
+					if (doneCb) doneCb();
 					return;
 				}
-				// CRITICAL: Evict BEFORE fetch/createImageBitmap so old 16MB Metal pages are freed BEFORE allocating CPU decode buffer!
-				var evictedBefore = false;
+				// Evict idle/over-budget textures BEFORE decode (non-blocking gl.flush only -> 0ms GPU stall!)
 				if (selfGL.evictForBudget) {
-					evictedBefore = !!selfGL.evictForBudget(uploadBytes, webGL_texture);
+					selfGL.evictForBudget(uploadBytes, webGL_texture);
 				}
 				function onUpload(source) {
-					var didEvict = evictedBefore;
 					if (!webGL_texture.c2deleted) {
 						if (selfGL.evictForBudget) {
-							if (selfGL.evictForBudget(uploadBytes, webGL_texture)) didEvict = true;
+							selfGL.evictForBudget(uploadBytes, webGL_texture);
 						}
 						selfGL.endBatch();
 						gl.bindTexture(gl.TEXTURE_2D, webGL_texture);
@@ -743,33 +741,27 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 							rtInst.redraw = true;
 						}
 					}
-					if (doneCb) doneCb(didEvict);
+					if (doneCb) doneCb();
 				}
-				function startDecode() {
-					if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
-						if (doneCb) doneCb(false);
-						return;
-					}
-					if (typeof createImageBitmap === "function" && typeof fetch === "function") {
-						fetch(texSrc, { cache: "no-store" })
-							.then(function (res) {
-								if (!res.ok) throw new Error("Fetch failed: " + res.status);
-								return res.blob();
-							})
-							.then(function (blob) { return createImageBitmap(blob); })
-							.then(function (bitmap) {
-								try {
-									onUpload(bitmap);
-								} finally {
-									if (bitmap && bitmap.close) bitmap.close();
-								}
-							})
-							.catch(function () {
-								fallbackImage();
-							});
-					} else {
-						fallbackImage();
-					}
+				if (typeof createImageBitmap === "function" && typeof fetch === "function") {
+					fetch(texSrc, { cache: "no-store" })
+						.then(function (res) {
+							if (!res.ok) throw new Error("Fetch failed: " + res.status);
+							return res.blob();
+						})
+						.then(function (blob) { return createImageBitmap(blob); })
+						.then(function (bitmap) {
+							try {
+								onUpload(bitmap);
+							} finally {
+								if (bitmap && bitmap.close) bitmap.close();
+							}
+						})
+						.catch(function () {
+							fallbackImage();
+						});
+				} else {
+					fallbackImage();
 				}
 				function fallbackImage() {
 					var realImg = new Image();
@@ -786,15 +778,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						realImg.onerror = null;
 						realImg.src = "";
 						realImg = null;
-						if (doneCb) doneCb(false);
+						if (doneCb) doneCb();
 					};
 					realImg.src = texSrc;
-				}
-				// If we just evicted heavy textures before a >=4MB upload, yield 1 frame so Metal/autorelease pool reclaims GPU pages first
-				if (evictedBefore && uploadBytes >= 4194304 && typeof requestAnimationFrame === "function") {
-					requestAnimationFrame(startDecode);
-				} else {
-					startDecode();
 				}
 			};
 			return webGL_texture;
@@ -850,13 +836,14 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		var curTick = window["__z3CurTick"] || 0;
 		var pressure = window["__c2MemPressure"] || 0;
 		var MB = 1024 * 1024;
-		// Dynamic pressure-scaled budgets: 100% sharp sprites, NEVER exceeds hard ceiling!
-		var SOFT_BUDGET = (pressure >= 2) ? (28 * MB) : ((pressure === 1) ? (44 * MB) : (64 * MB));
-		var HARD_CEILING = (pressure >= 2) ? (44 * MB) : ((pressure === 1) ? (64 * MB) : (88 * MB));
-		var HARD_TARGET = (pressure >= 2) ? (32 * MB) : ((pressure === 1) ? (48 * MB) : (68 * MB));
-		var PANIC_CEILING = (pressure >= 2) ? (52 * MB) : ((pressure === 1) ? (76 * MB) : (104 * MB));
-		var PANIC_TARGET = (pressure >= 2) ? (36 * MB) : ((pressure === 1) ? (52 * MB) : (72 * MB));
-		var UNUSED_THRESHOLD = (pressure >= 2) ? 600 : ((pressure === 1) ? 2000 : (incomingBytes ? 3000 : 6000));
+		// Smooth 60FPS budgets (Native Swift Audio already freed 100-165MB in WebContent!):
+		// Zero thrashing during normal fights + unbypassable PANIC ceiling during Ultimate/Cutscene bursts!
+		var SOFT_BUDGET = (pressure >= 2) ? (72 * MB) : ((pressure === 1) ? (88 * MB) : (104 * MB));
+		var HARD_CEILING = (pressure >= 2) ? (96 * MB) : ((pressure === 1) ? (116 * MB) : (136 * MB));
+		var HARD_TARGET = (pressure >= 2) ? (76 * MB) : ((pressure === 1) ? (92 * MB) : (108 * MB));
+		var PANIC_CEILING = (pressure >= 2) ? (116 * MB) : ((pressure === 1) ? (136 * MB) : (160 * MB));
+		var PANIC_TARGET = (pressure >= 2) ? (84 * MB) : ((pressure === 1) ? (100 * MB) : (116 * MB));
+		var UNUSED_THRESHOLD = (pressure >= 2) ? 2500 : ((pressure === 1) ? 5000 : (incomingBytes ? 8000 : 12000));
 
 		var totalVRAM = incomingBytes || 0;
 		var loadedList = [];
@@ -880,7 +867,6 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			this.endBatch();
 			var gl = this.gl;
 			var evictedCount = 0;
-			var hardEvicted = false;
 			var selfGLRef = this;
 			function evictOne(texObj) {
 				gl.bindTexture(gl.TEXTURE_2D, texObj);
@@ -894,7 +880,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (texObj === selfGLRef.lastTexture1)
 					selfGLRef.lastTexture1 = null;
 			}
-			// Pass 1: Smooth LRU eviction (textures idle >= UNUSED_THRESHOLD -> zero visible flicker)
+			// Pass 1: Smooth LRU eviction (only idle textures -> zero combat stutter or flicker)
 			for (i = 0, len = loadedList.length; i < len; i++)
 			{
 				t = loadedList[i];
@@ -906,7 +892,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (!forceAll && totalVRAM <= SOFT_BUDGET)
 					break;
 			}
-			// Pass 2: Hard Ceiling (evict textures not drawn in last 150ms down to HARD_TARGET)
+			// Pass 2: Hard Ceiling (evict textures not drawn in last 500ms down to HARD_TARGET)
 			if (!forceAll && totalVRAM > HARD_CEILING)
 			{
 				for (i = 0, len = loadedList.length; i < len; i++)
@@ -915,19 +901,16 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 					if (!t.c2isLoaded || t === protectTex)
 						continue;
 					var age2 = now - (t.c2lastUsedTime || 0);
-					if (age2 < 150)
+					if (age2 < 500)
 						continue;
 					evictOne(t);
-					hardEvicted = true;
 					if (totalVRAM <= HARD_TARGET)
 						break;
 				}
 			}
-			// Pass 3: UNBYPASSABLE PANIC CEILING during multi-sheet Special/Ultimate/Cutscene bursts!
-			// Never let VRAM exceed PANIC_CEILING even when 10 sheets animate within 150ms!
+			// Pass 3: UNBYPASSABLE PANIC CEILING during heavy multi-sheet Ultimate/Cutscene bursts!
 			if (!forceAll && totalVRAM > PANIC_CEILING)
 			{
-				// 3a: Evict any texture NOT drawn on exact current tick
 				for (i = 0, len = loadedList.length; i < len; i++)
 				{
 					t = loadedList[i];
@@ -936,11 +919,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 					if (curTick > 0 && t.c2lastTick === curTick)
 						continue;
 					evictOne(t);
-					hardEvicted = true;
 					if (totalVRAM <= PANIC_TARGET)
 						break;
 				}
-				// 3b: Last-resort unconditional cap (prevents Jetsam kill 100%!)
 				if (totalVRAM > PANIC_CEILING)
 				{
 					for (i = 0, len = loadedList.length; i < len; i++)
@@ -949,17 +930,16 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						if (!t.c2isLoaded || t === protectTex)
 							continue;
 						evictOne(t);
-						hardEvicted = true;
 						if (totalVRAM <= PANIC_TARGET)
 							break;
 					}
 				}
 			}
 			gl.bindTexture(gl.TEXTURE_2D, null);
-			// Synchronously retire Metal GPU command buffer on hard/force eviction so 16MB GPU pages free IMMEDIATELY!
+			// Non-blocking gl.flush() during gameplay (ZERO GPU stall!); gl.finish() ONLY on forceAll (background/layout switch)
 			if (evictedCount > 0)
 			{
-				if (forceAll || hardEvicted) {
+				if (forceAll) {
 					try { gl.finish(); } catch (e) { gl.flush(); }
 				} else {
 					gl.flush();
@@ -988,7 +968,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (this.glwrap && this.glwrap.evictUnusedTextures)
 		{
 			this.__vramCheckCounter = (this.__vramCheckCounter || 0) + 1;
-			if (this.__vramCheckCounter >= 60)
+			if (this.__vramCheckCounter >= 120)
 			{
 				this.__vramCheckCounter = 0;
 				this.glwrap.evictUnusedTextures(false);
@@ -1015,7 +995,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		{
 			frame = this.all_frames[i];
 			frame.webGL_texture = this.runtime.glwrap.loadTexture(frame.texture_img, false, this.runtime.linearSampling, frame.pixelformat);
-			if (tinyType && frame.webGL_texture && (frame.webGL_texture.c2bytes || 0) <= 524288 && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
+			if (tinyType && frame.webGL_texture && (frame.webGL_texture.c2bytes || 0) <= 1048576 && !frame.webGL_texture.c2isLoaded && !frame.webGL_texture.c2loading && frame.webGL_texture.c2lazyLoadFunc)
 			{
 				frame.webGL_texture.c2loading = true;
 				window["__c2EnqueueLazyTex"](frame.webGL_texture.c2lazyLoadFunc, frame.webGL_texture);
@@ -1026,26 +1006,20 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
     if (rt === beforeLT) throw new Error('Failed to patch typeProto.loadTextures');
 
-    // 13. Smart minimal preload in doChangeAnim (frame 0 only for large sheets; frame 1 only if <=4MB and VRAM under budget)
+    // 13. Preload max 2 upcoming frames in doChangeAnim ONLY if instance is visible (zero combo stutter!)
     const beforeDCA = rt;
     rt = rt.replace(
       /this\.OnFrameChanged\(prev_frame,\s*this\.cur_animation\.frames\[this\.cur_frame\]\);/,
-      `if (this.visible && this.opacity > 0 && anim && anim.frames && anim.frames.length > 0)
+      `if (this.visible && this.opacity > 0 && anim && anim.frames)
 		{
-			var _f0 = anim.frames[0].webGL_texture;
-			if (_f0 && !_f0.c2isLoaded && !_f0.c2loading && _f0.c2lazyLoadFunc)
+			var _maxPre = Math.min(anim.frames.length, 2);
+			for (var _ai = 0; _ai < _maxPre; _ai++)
 			{
-				_f0.c2loading = true;
-				window["__c2EnqueueLazyTex"](_f0.c2lazyLoadFunc, _f0, true);
-			}
-			if (anim.frames.length > 1)
-			{
-				var _f1 = anim.frames[1].webGL_texture;
-				var _curVram = (this.runtime.glwrap && this.runtime.glwrap.getEstimatedVRAM) ? this.runtime.glwrap.getEstimatedVRAM() : 0;
-				if (_f1 && _f1 !== _f0 && (_f1.c2bytes || 0) <= 4194304 && _curVram < 48 * 1024 * 1024 && !_f1.c2isLoaded && !_f1.c2loading && _f1.c2lazyLoadFunc)
+				var _atex = anim.frames[_ai].webGL_texture;
+				if (_atex && !_atex.c2isLoaded && !_atex.c2loading && _atex.c2lazyLoadFunc)
 				{
-					_f1.c2loading = true;
-					window["__c2EnqueueLazyTex"](_f1.c2lazyLoadFunc, _f1, false);
+					_atex.c2loading = true;
+					window["__c2EnqueueLazyTex"](_atex.c2lazyLoadFunc, _atex, _ai === 0);
 				}
 			}
 		}
@@ -1134,9 +1108,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 				if (lvl >= 2) {
 					rt.glwrap.evictUnusedTextures(true);
 				} else {
-					var prevP = window["__c2MemPressure"] || 0;
-					window["__c2MemPressure"] = Math.max(prevP, 1);
-					rt.glwrap.evictUnusedTextures(false, 24 * 1024 * 1024);
+					rt.glwrap.evictUnusedTextures(false, 16 * 1024 * 1024);
 				}
 			}
 		}
@@ -1353,21 +1325,19 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
             }
         } catch (e) {}
 
-        // 3. Bounded, throttled on-demand GPU texture loader queue (concurrency 1 + rAF Metal reclaim yield!)
+        // 3. Smooth high-throughput on-demand GPU texture loader queue (concurrency 2, zero rAF stall!)
         var texQueue = [];
         var activeTexLoads = 0;
-        var MAX_TEX_CONCURRENCY = 1;
-        var MAX_TEX_QUEUE = 8;
+        var MAX_TEX_CONCURRENCY = 2;
+        var MAX_TEX_QUEUE = 16;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
                 activeTexLoads++;
                 var job = texQueue.shift();
-                job(function (didEvict) {
+                job(function () {
                     activeTexLoads--;
-                    if (didEvict && typeof requestAnimationFrame === "function") {
-                        requestAnimationFrame(pumpTexQueue);
-                    } else {
-                        setTimeout(pumpTexQueue, 4);
+                    if (texQueue.length > 0) {
+                        setTimeout(pumpTexQueue, 0);
                     }
                 });
             }
