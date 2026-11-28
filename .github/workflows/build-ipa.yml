@@ -110,7 +110,7 @@ jobs:
           rm -rf dist
           mkdir -p dist/Payload
           cp -R "$APP_PATH" dist/Payload/ZLegends3.app
-          codesign --force --deep --sign - dist/Payload/ZLegends3.app
+          codesign --force --deep --sign - --entitlements ios/ZLegends3.entitlements dist/Payload/ZLegends3.app
 
           cd dist
           ditto -c -k --sequesterRsrc --keepParent Payload Z_Legends_3.ipa

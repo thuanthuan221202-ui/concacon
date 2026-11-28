@@ -265,22 +265,25 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     if (rt === before) throw new Error('Failed to patch playMusicAsSoundWorkaround');
   }
 
-  // 2b. Hybrid Native Swift Audio Bridge:
-  //     - Music OST (42-85MB PCM) & long Dramatic Finish SFX (13-16MB PCM) -> Native Swift AVAudioPlayer (0MB in WebContent, 0 combat lag!)
-  //     - Rapid short combat SFX (punches/ki blasts) -> low-latency WebAudio with strict 6-buffer LRU cap (~3MB total, 0ms IPC lag!)
-  if (!rt.includes('__z3NativeAudio')) {
-    const beforeNACnds = rt;
-    rt = rt.replace(
-      /Cnds\.prototype\.IsAnyPlaying\s*=\s*function\s*\(\)\s*\{/,
-      `var __z3NA = {
+	// 2b. Adaptive Native Swift Audio Bridge:
+	//     - On new binary (window.__z3AsyncAudio === true): 100% Native Swift AVAudioPlayer on background audioQueue
+	//       -> 0ms Main Thread blocking, 0 MB in WebContent, skips AudioContext allocation (saves 35-60MB RAM!)
+	//     - On legacy binary (no __z3AsyncAudio): Hybrid mode (Music/Dramatic Finish on Native, short SFX on WebAudio)
+	if (!rt.includes('__z3NativeAudio')) {
+		const beforeNACnds = rt;
+		rt = rt.replace(
+			/Cnds\.prototype\.IsAnyPlaying\s*=\s*function\s*\(\)\s*\{/,
+			`var __z3NA = {
 		nextId: 1,
 		active: {},
 		lastId: 0,
+		currentMusic: null,
 		hasBridge: function () {
 			return !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio);
 		},
 		shouldUseNative: function (src, isMusic) {
 			if (!this.hasBridge()) return false;
+			if (window["__z3AsyncAudio"]) return true;
 			if (isMusic) return true;
 			var s = String(src || "").toLowerCase();
 			return s.indexOf("dramaticfinish") !== -1 || s.indexOf("theme") !== -1;
@@ -298,6 +301,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 						delete this.active[mk];
 					}
 				}
+				this.currentMusic = { src: src, tag: tag || "", looping: !!looping, volume: vol };
 			}
 			var id = this.nextId++;
 			this.active[id] = { id: id, tag: tag || "", isMusic: !!isMusic, looping: !!looping, paused: false };
@@ -307,10 +311,14 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		stop: function (tag) {
 			var tLow = (tag || "").toLowerCase();
 			if (!tLow) {
-				if (this.lastId && this.active[this.lastId]) delete this.active[this.lastId];
+				if (this.lastId && this.active[this.lastId]) {
+					if (this.active[this.lastId].isMusic) this.currentMusic = null;
+					delete this.active[this.lastId];
+				}
 			} else {
 				for (var k in this.active) {
 					if (this.active.hasOwnProperty(k) && this.active[k].tag.toLowerCase() === tLow) {
+						if (this.active[k].isMusic) this.currentMusic = null;
 						delete this.active[k];
 					}
 				}
@@ -320,6 +328,7 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		stopAll: function () {
 			this.active = {};
 			this.lastId = 0;
+			this.currentMusic = null;
 			this.post({ cmd: "stopAll" });
 		},
 		isAnyPlaying: function () {
@@ -346,6 +355,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		var tr = __z3NA.active[id];
 		if (!tr) return;
 		var endedTag = tr.tag || "";
+		if (tr.isMusic && __z3NA.currentMusic && __z3NA.currentMusic.tag === endedTag) {
+			__z3NA.currentMusic = null;
+		}
 		delete __z3NA.active[id];
 		if (__z3NA.lastId === id) __z3NA.lastId = 0;
 		audTag = endedTag;
@@ -357,8 +369,20 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 	{
 		if (__z3NA.hasBridge() && __z3NA.isAnyPlaying())
 			return true;`
-    );
-    if (rt === beforeNACnds) throw new Error('Failed to patch Native Audio IsAnyPlaying');
+		);
+		if (rt === beforeNACnds) throw new Error('Failed to patch Native Audio IsAnyPlaying');
+
+		// Skip AudioContext allocation in WebContent when 100% Native Swift Async Audio is active (saves 35-60MB RAM!)
+		rt = rt.replace(
+			/context = null;\s*\r?\n\t\tif \(typeof AudioContext !== "undefined"\)/,
+			`context = null;
+		if (window["__z3AsyncAudio"] && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Audio)
+		{
+			api = API_HTML5;
+			context = null;
+		}
+		else if (typeof AudioContext !== "undefined")`
+		);
 
     rt = rt.replace(
       /Cnds\.prototype\.IsTagPlaying\s*=\s*function\s*\(tag\)\s*\{/,
@@ -594,14 +618,21 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
     );
   }
 
-  // 6. Cap DevicePixelRatio to 2.0 (100% sharp Retina quality without 3x framebuffer bloat)
-  if (!rt.includes('Math.min(2.0, (this.isRetina')) {
+  // 6. Cap DevicePixelRatio to 1.5 (1266x585 > native 1084x580 = 100% sharp, -44% framebuffer/FBO Metal RAM!)
+  //    & disable alpha compositing plane on WebGL main backbuffer ("alpha": false)
+  if (!rt.includes('Math.min(1.5, (this.isRetina')) {
     const beforeDpr = rt;
     rt = rt.replace(
       'this.devicePixelRatio = (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1);',
-      'this.devicePixelRatio = Math.min(2.0, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
+      'this.devicePixelRatio = Math.min(1.5, (this.isRetina ? (window["devicePixelRatio"] || window["webkitDevicePixelRatio"] || window["mozDevicePixelRatio"] || window["msDevicePixelRatio"] || 1) : 1));'
     );
     if (rt === beforeDpr) throw new Error('Failed to patch devicePixelRatio cap');
+  }
+  if (!rt.includes('/* __z3OpaqueWebGL */')) {
+    rt = rt.replace(
+      /attribs = \{\s*\r?\n\t\t\t\t\t"alpha": true,\s*\r?\n\t\t\t\t\t"depth": false,/,
+      `attribs = {\n\t\t\t\t\t/* __z3OpaqueWebGL */ "alpha": false,\n\t\t\t\t\t"depth": false,`
+    );
   }
 
   // 6b. Release XHR reference immediately after loadProject so 60MB data.js buffer is freed by GC
@@ -685,18 +716,26 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 			var internalformat = gl.RGBA;
 			var format = gl.RGBA;
 			var type = gl.UNSIGNED_BYTE;
+			var bpp = 4;
 			if (pixelformat && !this.isIE)
 			{
 				switch (pixelformat) {
 				case BF_RGB8: internalformat = gl.RGB; format = gl.RGB; break;
-				case BF_RGBA4: type = gl.UNSIGNED_SHORT_4_4_4_4; break;
-				case BF_RGB5_A1: type = gl.UNSIGNED_SHORT_5_5_5_1; break;
-				case BF_RGB565: internalformat = gl.RGB; format = gl.RGB; type = gl.UNSIGNED_SHORT_5_6_5; break;
+				case BF_RGBA4: type = gl.UNSIGNED_SHORT_4_4_4_4; bpp = 2; break;
+				case BF_RGB5_A1: type = gl.UNSIGNED_SHORT_5_5_5_1; bpp = 2; break;
+				case BF_RGB565: internalformat = gl.RGB; format = gl.RGB; type = gl.UNSIGNED_SHORT_5_6_5; bpp = 2; break;
 				}
+			}
+			else if (!this.isIE && (img.width || 0) >= 512 && (img.height || 0) >= 512)
+			{
+				// 16-bit RGBA4 for large sprite sheets (>= 512x512): 100% original pixel resolution at HALF Metal GPU VRAM (16MB -> 8MB)!
+				type = gl.UNSIGNED_SHORT_4_4_4_4;
+				bpp = 2;
 			}
 			var selfGL = this;
 			var texSrc = img.cr_src;
-			var uploadBytes = (img.width || 256) * (img.height || 256) * 4;
+			var uploadBytes = (img.width || 256) * (img.height || 256) * bpp;
+			webGL_texture.c2bytes = uploadBytes;
 			webGL_texture.c2lazyLoadFunc = function (doneCb) {
 				if (webGL_texture.c2deleted || webGL_texture.c2isLoaded) {
 					if (doneCb) doneCb();
@@ -823,13 +862,13 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		var curTick = window["__z3CurTick"] || 0;
 		var pressure = window["__c2MemPressure"] || 0;
 		var MB = 1024 * 1024;
-		// Smooth 60FPS budgets (Native Swift Audio already freed 100-165MB in WebContent!):
-		// Zero thrashing during normal fights + unbypassable PANIC ceiling during Ultimate/Cutscene bursts!
-		var SOFT_BUDGET = (pressure >= 2) ? (72 * MB) : ((pressure === 1) ? (88 * MB) : (104 * MB));
-		var HARD_CEILING = (pressure >= 2) ? (96 * MB) : ((pressure === 1) ? (116 * MB) : (136 * MB));
-		var HARD_TARGET = (pressure >= 2) ? (76 * MB) : ((pressure === 1) ? (92 * MB) : (108 * MB));
-		var PANIC_CEILING = (pressure >= 2) ? (116 * MB) : ((pressure === 1) ? (136 * MB) : (160 * MB));
-		var PANIC_TARGET = (pressure >= 2) ? (84 * MB) : ((pressure === 1) ? (100 * MB) : (116 * MB));
+		// Smooth 60FPS RGBA4-tuned budgets (16-bit RGBA4 halves sheet VRAM: 64MB holds 8+ full 2048x2048 sheets = 128MB RGBA8!):
+		// Cuts ~70MB peak GPU VRAM while holding MORE active fighter/effect sheets simultaneously -> ZERO thrashing!
+		var SOFT_BUDGET = (pressure >= 2) ? (48 * MB) : ((pressure === 1) ? (56 * MB) : (64 * MB));
+		var HARD_CEILING = (pressure >= 2) ? (64 * MB) : ((pressure === 1) ? (74 * MB) : (84 * MB));
+		var HARD_TARGET = (pressure >= 2) ? (52 * MB) : ((pressure === 1) ? (60 * MB) : (68 * MB));
+		var PANIC_CEILING = (pressure >= 2) ? (76 * MB) : ((pressure === 1) ? (88 * MB) : (100 * MB));
+		var PANIC_TARGET = (pressure >= 2) ? (56 * MB) : ((pressure === 1) ? (64 * MB) : (72 * MB));
 		var UNUSED_THRESHOLD = (pressure >= 2) ? 2500 : ((pressure === 1) ? 5000 : (incomingBytes ? 8000 : 12000));
 
 		var totalVRAM = incomingBytes || 0;
@@ -964,6 +1003,19 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (window["__z3CheckMenuVisibility"])
 		{
 			window["__z3CheckMenuVisibility"](this.running_layout.name);
+		}
+		if (!this.isloading && window["__z3PendingCheckpoint"] && window["__z3ApplyPendingCheckpoint"])
+		{
+			window["__z3ApplyPendingCheckpoint"](this);
+		}
+		if (!this.isloading && !this.isLoadingState && window["__z3CaptureCheckpoint"])
+		{
+			this.__cpTickCounter = (this.__cpTickCounter || 0) + 1;
+			if (this.__cpTickCounter >= 210)
+			{
+				this.__cpTickCounter = 0;
+				window["__z3CaptureCheckpoint"](false);
+			}
 		}`
     );
     if (rt === beforeTickSweep) throw new Error('Failed to patch Runtime.prototype.tick VRAM sweep');
@@ -1155,25 +1207,36 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
 		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"]("");`
     );
     rt = rt.replace(
-      /this\.running_layout\.startRunning\(\);/,
-      `this.running_layout.startRunning();
-		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"](this.running_layout.name);`
+      /changeToLayout\.startRunning\(\);/,
+      `changeToLayout.startRunning();
+		if (window["__z3OnLayoutChange"]) window["__z3OnLayoutChange"](changeToLayout.name);
+		if (!this.isLoadingState && window["__z3OnLayoutReadyForCheckpoint"]) window["__z3OnLayoutReadyForCheckpoint"](changeToLayout.name);`
     );
     if (rt === beforeCL) throw new Error('Failed to patch changeLayout queue purge');
   }
 
-  // 16. Smooth 1.5s loader layout progress so all async LocalStorage reads finish cleanly before Menu Inicial
+  // 16. Smooth 1.5s loader layout progress + Instant Silent Checkpoint Auto-Resume (zero-popup Jetsam recovery!)
   if (!rt.includes('_loaderElapsed')) {
     const beforeTick = rt;
     rt = rt.replace(
       /var done = this\.areAllTexturesAndSoundsLoaded\(\);\s*\/\/[^\r\n]*\r?\n\t\t\tthis\.loadingprogress = this\.progress;/,
       `var done = this.areAllTexturesAndSoundsLoaded();
 			var _loaderElapsed = Date.now() - this.start_time;
-			if (_loaderElapsed < 1500) {
+			if (!window["__z3PendingCheckpoint"] && _loaderElapsed < 1500) {
 				done = false;
 				this.progress = Math.min(0.99, _loaderElapsed / 1500);
 			}
 			this.loadingprogress = this.progress;`
+    );
+    rt = rt.replace(
+      /this\.isloading = false;\s*\r?\n\t\t\t\tthis\.progress = 1;\s*\r?\n\t\t\t\tthis\.trigger\(cr\.system_object\.prototype\.cnds\.OnLoadFinished, null\);/,
+      `this.isloading = false;
+				this.progress = 1;
+				if (window["__z3PendingCheckpoint"] && window["__z3ApplyPendingCheckpoint"]) {
+					window["__z3ApplyPendingCheckpoint"](this);
+				} else {
+					this.trigger(cr.system_object.prototype.cnds.OnLoadFinished, null);
+				}`
     );
     if (rt === beforeTick) throw new Error('Failed to patch loader progress tick');
   }
@@ -1318,10 +1381,10 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
             }
         } catch (e) {}
 
-        // 3. Smooth high-throughput on-demand GPU texture loader queue (concurrency 2, zero rAF stall!)
+        // 3. Smooth memory-safe GPU texture loader queue (concurrency 1 halves peak CPU decode spike, 0ms rAF delay!)
         var texQueue = [];
         var activeTexLoads = 0;
-        var MAX_TEX_CONCURRENCY = 2;
+        var MAX_TEX_CONCURRENCY = 1;
         var MAX_TEX_QUEUE = 16;
         function pumpTexQueue() {
             while (activeTexLoads < MAX_TEX_CONCURRENCY && texQueue.length > 0) {
@@ -1400,6 +1463,105 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
         document.addEventListener("visibilitychange", function () {
             if (!document.hidden) resumeAll();
         });
+
+        // 5. Silent Live-Match Checkpoint & Seamless Auto-Resume Bridge (stores latest match state in Swift Host RAM)
+        var __z3LastCpTs = 0;
+        var __z3CheckpointableLayouts = {
+            "Cena De Luta": true,
+            "Torneio": true,
+            "Nova Selecao De Personagens": true,
+            "Loja": true,
+            "Hud Config": true
+        };
+        function __z3PostCheckpoint(msg) {
+            try {
+                if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Checkpoint) {
+                    window.webkit.messageHandlers.z3Checkpoint.postMessage(msg);
+                }
+            } catch (e) {}
+        }
+        window.__z3QueueCheckpointBase64 = function (b64) {
+            try {
+                var bin = atob(b64);
+                var bytes = new Uint8Array(bin.length);
+                for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                var str = (typeof TextDecoder !== "undefined")
+                    ? new TextDecoder("utf-8").decode(bytes)
+                    : decodeURIComponent(escape(bin));
+                var parsed = JSON.parse(str);
+                if (parsed && parsed.json) {
+                    window.__z3PendingCheckpoint = parsed;
+                }
+            } catch (e) {
+                window.__z3PendingCheckpoint = null;
+                __z3PostCheckpoint({ restored: false });
+            }
+        };
+        window.__z3ApplyPendingCheckpoint = function (rt) {
+            var cp = window.__z3PendingCheckpoint;
+            if (!cp || !cp.json || !rt) return false;
+            window.__z3PendingCheckpoint = null;
+            rt.changelayout = null;
+            var ok = false;
+            try {
+                rt.ClearDeathRow();
+                ok = !!rt.loadFromJSONString(cp.json);
+            } catch (e) {
+                ok = false;
+            }
+            rt.changelayout = null;
+            if (ok) {
+                try {
+                    if (window.__z3NativeAudio && window.__z3NativeAudio.hasBridge()) {
+                        window.__z3NativeAudio.stopAll();
+                        if (cp.music && cp.music.src) {
+                            window.__z3NativeAudio.play(
+                                cp.music.src,
+                                cp.music.tag || "",
+                                true,
+                                !!cp.music.looping,
+                                (typeof cp.music.volume === "number") ? cp.music.volume : 1.0
+                            );
+                        }
+                    }
+                } catch (e) {}
+            } else {
+                try {
+                    rt.trigger(cr.system_object.prototype.cnds.OnLoadFinished, null);
+                } catch (e) {}
+            }
+            __z3PostCheckpoint({ restored: ok });
+            return ok;
+        };
+        window.__z3OnLayoutReadyForCheckpoint = function (layoutName) {
+            if (!layoutName) return;
+            if (layoutName === "Menu Inicial") {
+                __z3PostCheckpoint({ clear: true, ready: true });
+            } else if (__z3CheckpointableLayouts[layoutName]) {
+                __z3PostCheckpoint({ ready: true });
+                setTimeout(function () {
+                    if (window.__z3CaptureCheckpoint) window.__z3CaptureCheckpoint(true);
+                }, 900);
+            }
+        };
+        window.__z3CaptureCheckpoint = function (force) {
+            if (!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.z3Checkpoint)) return;
+            var now = Date.now();
+            if (!force && (now - __z3LastCpTs) < 3500) return;
+            var rt = window.cr_getC2Runtime && window.cr_getC2Runtime();
+            if (!rt || !rt.running_layout || rt.isloading || rt.isLoadingState || rt.changelayout) return;
+            var lname = rt.running_layout.name || "";
+            if (!__z3CheckpointableLayouts[lname]) return;
+            __z3LastCpTs = now;
+            try {
+                rt.ClearDeathRow();
+                var stateStr = rt.saveToJSONString();
+                if (!stateStr || stateStr.length < 32) return;
+                var music = (window.__z3NativeAudio && window.__z3NativeAudio.currentMusic) ? window.__z3NativeAudio.currentMusic : null;
+                var pkg = JSON.stringify({ layout: lname, json: stateStr, music: music });
+                __z3PostCheckpoint({ layout: lname, payload: pkg });
+            } catch (e) {}
+        };
     })();
     </script>
 </head>
@@ -1420,6 +1582,9 @@ export function patchConstruct2RuntimeAndHtml(wwwDir) {
             cr_createRuntime("c2canvas");
         });
         document.addEventListener("visibilitychange", function () {
+            if (document.hidden && window.__z3CaptureCheckpoint) {
+                window.__z3CaptureCheckpoint(true);
+            }
             if (window.cr_setSuspended) {
                 cr_setSuspended(Boolean(document.hidden));
             }

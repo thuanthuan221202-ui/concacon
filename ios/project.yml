@@ -33,6 +33,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.geneildosantos.zlegends3
         PRODUCT_NAME: ZLegends3
         INFOPLIST_FILE: Info.plist
+        CODE_SIGN_ENTITLEMENTS: ZLegends3.entitlements
         SWIFT_OBJC_BRIDGING_HEADER: Sources/ZLegends3-Bridging-Header.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"

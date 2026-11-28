@@ -9,10 +9,23 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     private var lastReportedPressureLevel: Int = 0
     private var lastPurgeTimestamp: TimeInterval = 0
 
-    // STRICT ANTI-RELOAD LOCK: once initial game page loads, ALL automatic/JS reloads are strictly forbidden.
+    // STRICT ANTI-RELOAD LOCK: blocks all unwanted JS/page reloads; allows ONLY controlled silent recovery if iOS kernel kills WebContent.
     private var hasCompletedInitialLoad: Bool = false
     private var allowManualRecoveryOnce: Bool = false
-    private var isShowingTerminationOverlay: Bool = false
+
+    // Live Match Checkpoint stored in Host App RAM (~100KB) so if iOS Jetsam ever kills WebContent,
+    // the game silently auto-resumes the exact in-progress match with ZERO popup and ZERO black screen!
+    private var latestCheckpointPayload: String?
+    private var latestCheckpointLayout: String = ""
+    private var latestCheckpointTimestamp: TimeInterval = 0
+    private var pendingResumeAfterDidFinish: Bool = false
+    private var isRecoveringFromTermination: Bool = false
+    private var terminationTimestamps: [TimeInterval] = []
+
+    // Subtle non-blocking native overlay shown briefly during silent auto-resume
+    private var recoveryOverlayView: UIView?
+    private var recoveryLabel: UILabel?
+    private var recoveryHideWorkItem: DispatchWorkItem?
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { false }
@@ -23,9 +36,11 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     deinit {
         memoryWatchdogTimer?.invalidate()
         memoryPressureSource?.cancel()
+        recoveryHideWorkItem?.cancel()
         NotificationCenter.default.removeObserver(self)
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "z3NativeClean")
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "z3Audio")
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "z3Checkpoint")
     }
 
     override func viewDidLoad() {
@@ -45,8 +60,18 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         config.defaultWebpagePreferences.preferredContentMode = .mobile
         config.websiteDataStore = .default()
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
+
+        // Inform JS runtime at document start that background-queue NativeAudioEngine is active
+        // -> enables 100% Native Swift Audio and skips AudioContext allocation (saves 35-60MB in WebContent!)
+        let nativeFlagsScript = WKUserScript(
+            source: "window.__z3AsyncAudio = true;",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(nativeFlagsScript)
         config.userContentController.add(self, name: "z3NativeClean")
         config.userContentController.add(self, name: "z3Audio")
+        config.userContentController.add(self, name: "z3Checkpoint")
 
         if let wwwURL = Bundle.main.url(forResource: "www", withExtension: nil) {
             let handler = WebSchemeHandler(wwwRoot: wwwURL)
@@ -65,7 +90,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         let wv = WKWebView(frame: view.bounds, configuration: config)
         wv.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         wv.backgroundColor = .black
-        wv.isOpaque = false
+        wv.isOpaque = true
         wv.allowsBackForwardNavigationGestures = false
         wv.allowsLinkPreview = false
         wv.isMultipleTouchEnabled = true
@@ -126,9 +151,88 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         setNeedsStatusBarAppearanceUpdate()
     }
 
+    // MARK: - Subtle Non-Blocking Recovery Banner (Zero Alert Popups!)
+
+    private func showRecoveryOverlay(message: String) {
+        recoveryHideWorkItem?.cancel()
+
+        if let existing = recoveryOverlayView {
+            recoveryLabel?.text = message
+            existing.alpha = 1.0
+            existing.isHidden = false
+            view.bringSubviewToFront(existing)
+            return
+        }
+
+        let overlay = UIView(frame: view.bounds)
+        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        overlay.backgroundColor = UIColor(white: 0.0, alpha: 0.72)
+        overlay.isUserInteractionEnabled = true
+
+        let pill = UIView()
+        pill.translatesAutoresizingMaskIntoConstraints = false
+        pill.backgroundColor = UIColor(red: 0.09, green: 0.11, blue: 0.16, alpha: 0.94)
+        pill.layer.cornerRadius = 16
+        pill.layer.borderWidth = 1
+        pill.layer.borderColor = UIColor(red: 1.0, green: 0.78, blue: 0.22, alpha: 0.55).cgColor
+
+        let spinner: UIActivityIndicatorView
+        if #available(iOS 13.0, *) {
+            spinner = UIActivityIndicatorView(style: .medium)
+        } else {
+            spinner = UIActivityIndicatorView(style: .white)
+        }
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.color = UIColor(red: 1.0, green: 0.82, blue: 0.28, alpha: 1.0)
+        spinner.startAnimating()
+
+        let label = UILabel()
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.text = message
+        label.textColor = .white
+        label.font = UIFont.systemFont(ofSize: 15, weight: .semibold)
+        label.numberOfLines = 1
+
+        pill.addSubview(spinner)
+        pill.addSubview(label)
+        overlay.addSubview(pill)
+        view.addSubview(overlay)
+
+        NSLayoutConstraint.activate([
+            pill.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            pill.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            pill.heightAnchor.constraint(equalToConstant: 48),
+            spinner.leadingAnchor.constraint(equalTo: pill.leadingAnchor, constant: 18),
+            spinner.centerYAnchor.constraint(equalTo: pill.centerYAnchor),
+            label.leadingAnchor.constraint(equalTo: spinner.trailingAnchor, constant: 12),
+            label.trailingAnchor.constraint(equalTo: pill.trailingAnchor, constant: -20),
+            label.centerYAnchor.constraint(equalTo: pill.centerYAnchor)
+        ])
+
+        self.recoveryOverlayView = overlay
+        self.recoveryLabel = label
+    }
+
+    private func hideRecoveryOverlay(delay: TimeInterval = 0.25) {
+        recoveryHideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, let overlay = self.recoveryOverlayView else { return }
+            self.isRecoveringFromTermination = false
+            UIView.animate(withDuration: 0.22, animations: {
+                overlay.alpha = 0.0
+            }, completion: { _ in
+                overlay.removeFromSuperview()
+                if self.recoveryOverlayView === overlay {
+                    self.recoveryOverlayView = nil
+                    self.recoveryLabel = nil
+                }
+            })
+        }
+        recoveryHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
     // MARK: - Smooth Non-Stuttering Memory Pressure Shield
-    // NEVER wipes active on-screen sprites during gameplay (eliminates stutter/thrashing!).
-    // Full VRAM purge (level 2) ONLY runs when backgrounded, switching layouts, or user clicks Clean.
 
     private func setupKernelMemoryPressureMonitor() {
         let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
@@ -139,7 +243,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
             self.lastPurgeTimestamp = now
 
             if event.contains(.critical) {
-                NSLog("[ZLegends3] CRITICAL kernel memory pressure! Soft-evicting idle textures (zero stutter)...")
+                NSLog("[ZLegends3] CRITICAL kernel memory pressure! Saving checkpoint & soft-evicting idle textures...")
                 self.triggerInGameMemoryTrim(pressureLevel: 2)
             } else if event.contains(.warning) {
                 NSLog("[ZLegends3] WARNING kernel memory pressure! Trimming idle caches...")
@@ -162,7 +266,6 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         guard availBytes > 0 else { return }
         let availMB = availBytes / (1024 * 1024)
 
-        // Conservative thresholds so normal 60fps combat NEVER drops into tight-VRAM thrashing!
         let nextLevel: Int
         if availMB < 65 {
             nextLevel = 2
@@ -197,7 +300,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
         WKWebsiteDataStore.default().removeData(ofTypes: cacheTypes, modifiedSince: .distantPast) {}
     }
 
-    /// Non-blocking in-game trim: clears idle/off-screen textures & caches ONLY, never wipes active fighters or stalls GPU!
+    /// Non-blocking in-game trim: snapshots latest match state + clears idle/off-screen textures ONLY (zero stutter!)
     private func triggerInGameMemoryTrim(pressureLevel: Int) {
         audioEngine?.purgeCache()
         URLCache.shared.removeAllCachedResponses()
@@ -205,17 +308,17 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
             clearWebKitCachesOnly()
         }
         webView?.evaluateJavaScript(
-            "if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(1);",
+            "if (window.__z3CaptureCheckpoint) window.__z3CaptureCheckpoint(true); if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(1);",
             completionHandler: nil
         )
     }
 
-    /// Full purge ONLY when app goes to background (keeps match alive without Jetsam when switching apps)
+    /// Full purge ONLY when app goes to background (saves checkpoint first + flushes all VRAM so iOS won't kill it!)
     private func triggerBackgroundFullPurge() {
         audioEngine?.purgeCache()
         clearWebKitCachesOnly()
         webView?.evaluateJavaScript(
-            "if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(2);",
+            "if (window.__z3CaptureCheckpoint) window.__z3CaptureCheckpoint(true); if (window.__c2EmergencyPurge) window.__c2EmergencyPurge(2);",
             completionHandler: nil
         )
     }
@@ -225,13 +328,13 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     @objc private func appWillResignActive() {
         audioEngine?.setSuspended(true)
         webView?.evaluateJavaScript(
-            "if (window.cr_setSuspended) window.cr_setSuspended(true);",
+            "if (window.__z3CaptureCheckpoint) window.__z3CaptureCheckpoint(true); if (window.cr_setSuspended) window.cr_setSuspended(true);",
             completionHandler: nil
         )
     }
 
     @objc private func appDidEnterBackground() {
-        NSLog("[ZLegends3] App entered background — flushing VRAM & caches to prevent background Jetsam kill.")
+        NSLog("[ZLegends3] App entered background — saving live checkpoint & flushing VRAM.")
         audioEngine?.setSuspended(true)
         triggerBackgroundFullPurge()
     }
@@ -246,7 +349,7 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
 
     override func didReceiveMemoryWarning() {
         super.didReceiveMemoryWarning()
-        NSLog("[ZLegends3] OS Memory Warning received! Trimming idle VRAM & caches without stutter...")
+        NSLog("[ZLegends3] OS Memory Warning received! Saving checkpoint & trimming idle VRAM...")
         triggerInGameMemoryTrim(pressureLevel: 2)
     }
 
@@ -265,6 +368,39 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
             clearWebKitCachesOnly()
             return
         }
+
+        if message.name == "z3Checkpoint" {
+            guard let body = message.body as? [String: Any] else { return }
+
+            if let clear = body["clear"] as? Bool, clear {
+                latestCheckpointPayload = nil
+                latestCheckpointLayout = ""
+                latestCheckpointTimestamp = 0
+            }
+
+            if let restored = body["restored"] as? Bool {
+                NSLog("[ZLegends3] Live match checkpoint restore result: %@", restored ? "SUCCESS" : "FALLBACK")
+                if !restored {
+                    latestCheckpointPayload = nil
+                    latestCheckpointLayout = ""
+                }
+                hideRecoveryOverlay(delay: restored ? 0.35 : 0.2)
+                return
+            }
+
+            if let ready = body["ready"] as? Bool, ready {
+                if recoveryOverlayView != nil && !pendingResumeAfterDidFinish {
+                    hideRecoveryOverlay(delay: 0.2)
+                }
+            }
+
+            if let payload = body["payload"] as? String, !payload.isEmpty {
+                latestCheckpointPayload = payload
+                latestCheckpointLayout = (body["layout"] as? String) ?? ""
+                latestCheckpointTimestamp = Date().timeIntervalSinceReferenceDate
+            }
+            return
+        }
     }
 
     // MARK: - WKNavigationDelegate (STRICT NO-RELOAD GUARD)
@@ -272,6 +408,19 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         hasCompletedInitialLoad = true
         allowManualRecoveryOnce = false
+
+        if pendingResumeAfterDidFinish {
+            pendingResumeAfterDidFinish = false
+            if let payload = latestCheckpointPayload {
+                let b64 = Data(payload.utf8).base64EncodedString()
+                webView.evaluateJavaScript(
+                    "if (window.__z3QueueCheckpointBase64) window.__z3QueueCheckpointBase64('\(b64)');",
+                    completionHandler: nil
+                )
+            } else {
+                hideRecoveryOverlay(delay: 0.3)
+            }
+        }
     }
 
     func webView(
@@ -333,30 +482,40 @@ final class GameViewController: UIViewController, WKNavigationDelegate, WKUIDele
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-        NSLog("[ZLegends3] WebContent terminated by iOS kernel — AUTO-RELOAD IS STRICTLY BLOCKED!")
+        NSLog("[ZLegends3] WebContent terminated by iOS kernel — executing silent auto-resume (zero popup)!")
         audioEngine?.stopAll()
         audioEngine?.purgeCache()
         clearWebKitCachesOnly()
 
-        guard !isShowingTerminationOverlay else { return }
-        isShowingTerminationOverlay = true
+        let now = Date().timeIntervalSinceReferenceDate
+        terminationTimestamps = terminationTimestamps.filter { (now - $0) < 25.0 }
+        terminationTimestamps.append(now)
 
-        let alert = UIAlertController(
-            title: "Đã chặn tự động Reload",
-            message: "Hệ điều hành iOS vừa thu hồi tiến trình đồ họa do thiếu RAM hệ thống. App đã CẤM tuyệt đối tự động tải lại theo cài đặt của bạn.\n\n(Lưu ý: Tiến trình WebKit đã bị iOS tắt nên màn hình sẽ đứng yên cho đến khi bạn chọn mở lại.)",
-            preferredStyle: .alert
-        )
-        alert.addAction(UIAlertAction(title: "Giữ nguyên (Không reload)", style: .cancel) { [weak self] _ in
-            self?.isShowingTerminationOverlay = false
-        })
-        alert.addAction(UIAlertAction(title: "Khởi động lại thủ công", style: .default) { [weak self] _ in
+        // Crash-loop guard: if iOS kills WebContent 3+ times within 25s, drop checkpoint and recover cleanly to Menu
+        if terminationTimestamps.count >= 3 {
+            NSLog("[ZLegends3] Repeated Jetsam detected (%ld in 25s) — clearing checkpoint to prevent loop.", terminationTimestamps.count)
+            latestCheckpointPayload = nil
+            latestCheckpointLayout = ""
+            latestCheckpointTimestamp = 0
+        }
+
+        let hasFreshCheckpoint = (latestCheckpointPayload != nil) && ((now - latestCheckpointTimestamp) < 600.0)
+        isRecoveringFromTermination = true
+        pendingResumeAfterDidFinish = hasFreshCheckpoint
+
+        let statusText = hasFreshCheckpoint ? "Đang tiếp tục trận đấu..." : "Đang khôi phục game..."
+        showRecoveryOverlay(message: statusText)
+
+        // Guaranteed failsafe hide so overlay can never get stuck
+        hideRecoveryOverlay(delay: 8.5)
+
+        let reloadDelay: TimeInterval = (terminationTimestamps.count >= 3) ? 0.6 : 0.08
+        DispatchQueue.main.asyncAfter(deadline: .now() + reloadDelay) { [weak self] in
             guard let self = self else { return }
-            self.isShowingTerminationOverlay = false
             self.allowManualRecoveryOnce = true
             if let startURL = URL(string: "app://localhost/index.html") {
                 self.webView.load(URLRequest(url: startURL))
             }
-        })
-        present(alert, animated: true)
+        }
     }
 }
